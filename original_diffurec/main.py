@@ -12,7 +12,7 @@ from model import create_model_diffu, Att_Diffuse_model
 from trainer import model_train, LSHT_inference
 from collections import Counter
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 
 parser = argparse.ArgumentParser()
