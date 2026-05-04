@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Datasets — слишком тяжёлые для GitHub (лимит 100 MB на файл)
+datasets/data/*/dataset.pkl
+
+# Checkpoints моделей
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Логи
+log/
+*.log
+
+# Окружения
+venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
