@@ -5,7 +5,7 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Datasets — слишком тяжёлые для GitHub (лимит 100 MB на файл)
-datasets/data/*/dataset.pkl
+data/datasets/*/dataset.pkl
 
 # Checkpoints моделей
 checkpoints/
