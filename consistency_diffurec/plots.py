@@ -256,30 +256,218 @@ def plot_sensitivity(param_name, param_values, results_per_value,
 
 
 # ---------- Figure 6: convergence curves ----------
-def plot_convergence(loss_log_csv, out_path='figures/convergence.pdf'):
+def plot_convergence(log_dir, out_path='figures/convergence.pdf', skip_warmup=0):
     """
-    Plot training-loss curves. Expects a CSV with columns
-    `epoch,cons_loss,ce_loss` (one row per epoch).
+    Plot training loss curves for the student, aggregated across seeds.
+
+    Reads all `seed_*.csv` files in `log_dir`, computes mean ± std across
+    seeds for each epoch, and plots a band.
+
+    Parameters
+    ----------
+    log_dir : str
+        Path like `logs/amazon_beauty/` containing per-seed CSV files
+        (`seed_1997.csv`, `seed_42.csv`, ...).
+    skip_warmup : int
+        Skip the first N epochs (loss can be huge at epoch 0 and squashes
+        the y-axis).
     """
     import csv
-    epochs, cons, ce = [], [], []
-    with open(loss_log_csv) as f:
-        r = csv.DictReader(f)
-        for row in r:
-            epochs.append(int(row['epoch']))
-            cons.append(float(row['cons_loss']))
-            ce.append(float(row['ce_loss']))
+    import glob
+
+    csv_paths = sorted(glob.glob(os.path.join(log_dir, 'seed_*.csv')))
+    csv_paths = [p for p in csv_paths if not p.endswith('.val.csv')]
+    if not csv_paths:
+        print(f'[plot_convergence] no CSVs found in {log_dir}; skip')
+        return
+
+    # Collect per-seed series
+    series = []
+    for p in csv_paths:
+        ep, cons, ce, total = [], [], [], []
+        with open(p) as f:
+            for row in csv.DictReader(f):
+                ep.append(int(row['epoch']))
+                cons.append(float(row['cons_loss']))
+                ce.append(float(row['ce_loss']))
+                total.append(float(row['total_loss']))
+        series.append((np.array(ep), np.array(cons), np.array(ce), np.array(total)))
+
+    # Pad to common length (early stopping makes seeds finish at different epochs)
+    max_len = max(len(s[0]) for s in series)
+    def _stack(idx):
+        rows = []
+        for s in series:
+            arr = s[idx]
+            if len(arr) < max_len:
+                arr = np.concatenate([arr, np.full(max_len - len(arr), np.nan)])
+            rows.append(arr)
+        return np.vstack(rows)
+
+    epochs = np.arange(max_len)
+    cons_mat  = _stack(1)
+    ce_mat    = _stack(2)
+    total_mat = _stack(3)
+
+    sl = slice(skip_warmup, None)
 
     apply_style()
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    axes[0].plot(epochs, cons, color=COLORS['student'], linewidth=2.0)
-    axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Consistency loss')
-    axes[0].set_title('Consistency loss')
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
 
-    axes[1].plot(epochs, ce, color=COLORS['baseline'], linewidth=2.0)
-    axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('Cross-entropy loss')
-    axes[1].set_title('Recommendation loss')
+    for ax, mat, title, color in [
+        (axes[0], cons_mat,  'Consistency loss',     COLORS['student']),
+        (axes[1], ce_mat,    'Cross-entropy loss',   COLORS['baseline']),
+        (axes[2], total_mat, 'Total weighted loss',  COLORS['tertiary']),
+    ]:
+        m = np.nanmean(mat, axis=0)[sl]
+        s = np.nanstd(mat, axis=0, ddof=1)[sl] if mat.shape[0] > 1 else np.zeros_like(m)
+        e = epochs[sl]
+        ax.plot(e, m, color=color, linewidth=2.0, label='mean across seeds')
+        ax.fill_between(e, m - s, m + s, color=COLORS['fill_light'], alpha=0.5,
+                        label=r'$\pm$ 1 std')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(title)
+        ax.set_title(title)
+        ax.legend(loc='upper right', fontsize=9)
 
+    fig.suptitle(f'Student training convergence ({len(series)} seeds)', y=1.02)
+    _save(fig, out_path)
+
+
+def plot_val_curves(log_dir, metric='HR@10', out_path='figures/val_curve.pdf'):
+    """
+    Validation HR/NDCG over training epochs, aggregated across seeds.
+    Reads `seed_*.csv.val.csv` files. Useful for showing convergence of the
+    student's recsys quality (not just the loss).
+    """
+    import csv
+    import glob
+
+    csv_paths = sorted(glob.glob(os.path.join(log_dir, 'seed_*.csv.val.csv')))
+    if not csv_paths:
+        print(f'[plot_val_curves] no val CSVs in {log_dir}; skip')
+        return
+
+    series = []
+    for p in csv_paths:
+        ep, val = [], []
+        with open(p) as f:
+            for row in csv.DictReader(f):
+                ep.append(int(row['epoch']))
+                val.append(float(row[metric]))
+        series.append((np.array(ep), np.array(val)))
+
+    max_len = max(len(s[0]) for s in series)
+    rows = []
+    for ep_arr, val_arr in series:
+        if len(val_arr) < max_len:
+            val_arr = np.concatenate([val_arr, np.full(max_len - len(val_arr), np.nan)])
+        rows.append(val_arr)
+    mat = np.vstack(rows)
+    epochs = series[0][0] if len(series[0][0]) == max_len else np.arange(max_len)
+
+    apply_style()
+    fig, ax = plt.subplots(figsize=(7, 4.2))
+    m = np.nanmean(mat, axis=0)
+    s = np.nanstd(mat, axis=0, ddof=1) if mat.shape[0] > 1 else np.zeros_like(m)
+    ax.plot(epochs[:len(m)], m, color=COLORS['student'], linewidth=2.0,
+            label='mean across seeds')
+    ax.fill_between(epochs[:len(m)], m - s, m + s,
+                    color=COLORS['fill_light'], alpha=0.5,
+                    label=r'$\pm$ 1 std')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel(f'Val {metric} (NFE=1)')
+    ax.set_title(f'Validation {metric} over training ({len(series)} seeds)')
+    ax.legend()
+    _save(fig, out_path)
+
+
+# ---------- Figure: main results bar chart with error bars ----------
+def plot_main_results_errorbars(results_per_dataset, metric='HR@10',
+                                out_path='figures/main_results_errorbars.pdf'):
+    """
+    Bar chart per dataset: teacher full / truncated DDIM at NFE=1 / student at NFE=1,
+    with std error bars across seeds for the student.
+    """
+    apply_style()
+    datasets = list(results_per_dataset.keys())
+    n = len(datasets)
+    fig, ax = plt.subplots(figsize=(max(6, 2.5 * n), 4.5))
+
+    x = np.arange(n)
+    w = 0.27
+
+    teacher_vals  = [r['teacher']['full_nfe'][metric] for r in results_per_dataset.values()]
+    baseline_vals = [r['baseline']['1'][metric] for r in results_per_dataset.values()]
+    student_means, student_stds = [], []
+    for r in results_per_dataset.values():
+        v = _gather(r, 1, metric)
+        student_means.append(v.mean())
+        student_stds.append(v.std(ddof=1) if len(v) > 1 else 0.0)
+
+    ax.bar(x - w, teacher_vals, w,  color=COLORS['teacher'],  label='Teacher (NFE=T)',
+           edgecolor='black', linewidth=0.5)
+    ax.bar(x,     baseline_vals, w, color=COLORS['baseline'], label='Truncated DDIM (NFE=1)',
+           edgecolor='black', linewidth=0.5)
+    ax.bar(x + w, student_means, w, yerr=student_stds, capsize=5,
+           color=COLORS['student'], label='Distilled student (NFE=1)',
+           edgecolor='black', linewidth=0.5,
+           error_kw={'ecolor': COLORS['tertiary'], 'elinewidth': 1.5})
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(datasets)
+    ax.set_ylabel(metric)
+    ax.set_title(f'Main results ({metric}, mean $\\pm$ std across seeds)')
+    ax.legend(loc='best')
+    _save(fig, out_path)
+
+
+# ---------- Figure: bootstrap confidence intervals ----------
+def plot_bootstrap_ci(results, metric='HR@10', n_boot=10000,
+                      out_path='figures/bootstrap_ci.pdf'):
+    """
+    For each NFE in the student's grid, draw a bootstrap 95% CI.
+    Visually answers: is the student's improvement over truncated-DDIM
+    at each NFE statistically meaningful?
+    """
+    apply_style()
+    nfe_grid = sorted(int(k) for k in results['baseline'].keys())
+
+    means, los, his = [], [], []
+    base_vals = []
+    rng = np.random.default_rng(0)
+    for nfe in nfe_grid:
+        v = _gather(results, nfe, metric)
+        means.append(v.mean())
+        if len(v) > 1:
+            boots = np.array([rng.choice(v, size=len(v), replace=True).mean()
+                              for _ in range(n_boot)])
+            los.append(np.percentile(boots, 2.5))
+            his.append(np.percentile(boots, 97.5))
+        else:
+            los.append(v.mean()); his.append(v.mean())
+        base_vals.append(results['baseline'][str(nfe)][metric])
+
+    means = np.array(means); los = np.array(los); his = np.array(his)
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(nfe_grid, means, marker=MARKERS['student'], color=COLORS['student'],
+            linewidth=2.0, label='Student (mean)')
+    ax.fill_between(nfe_grid, los, his, color=COLORS['fill_light'], alpha=0.6,
+                    label='Student 95% bootstrap CI')
+    ax.plot(nfe_grid, base_vals, marker=MARKERS['baseline'], color=COLORS['baseline'],
+            linewidth=2.0, linestyle='--', label='Truncated DDIM')
+    ax.axhline(results['teacher']['full_nfe'][metric], color=COLORS['teacher'],
+               linestyle=':', linewidth=1.8,
+               label=f"Teacher full (NFE={results['teacher']['T']})")
+
+    ax.set_xscale('log', base=2)
+    ax.set_xticks(nfe_grid)
+    ax.set_xticklabels(nfe_grid)
+    ax.set_xlabel('NFE')
+    ax.set_ylabel(metric)
+    ax.set_title(f'95% bootstrap CI — {results["dataset"]}')
+    ax.legend()
     _save(fig, out_path)
 
 
@@ -317,7 +505,11 @@ def main():
     ap.add_argument('--json_paths', nargs='+', required=True)
     ap.add_argument('--out_dir', default='figures')
     ap.add_argument('--metric', default='HR@10')
+    ap.add_argument('--logs_root', default='logs',
+                    help='Root dir of per-dataset, per-seed CSV logs '
+                         '(default: logs/, written by multi_seed_runner.py).')
     args = ap.parse_args()
+    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
     per_dataset = {}
     for path in args.json_paths:
@@ -330,6 +522,8 @@ def main():
     plot_tradeoff_nfe_quality(per_dataset, metric='NDCG@10',
                               out_path=os.path.join(args.out_dir, 'tradeoff_NDCG10.pdf'))
     plot_speedup(per_dataset, out_path=os.path.join(args.out_dir, 'speedup.pdf'))
+    plot_main_results_errorbars(per_dataset, metric=args.metric,
+                                out_path=os.path.join(args.out_dir, 'main_results_errorbars.pdf'))
 
     for name, res in per_dataset.items():
         slug = name.replace('/', '_').replace(' ', '_')
@@ -337,6 +531,18 @@ def main():
                     out_path=os.path.join(args.out_dir, f'pareto_{slug}.pdf'))
         plot_latency_bars(res,
                           out_path=os.path.join(args.out_dir, f'latency_{slug}.pdf'))
+        plot_bootstrap_ci(res, metric=args.metric,
+                          out_path=os.path.join(args.out_dir, f'bootstrap_ci_{slug}.pdf'))
+
+        # Convergence + val curves require per-seed CSVs from multi_seed_runner.
+        log_dir = os.path.join(args.logs_root, name)
+        if os.path.isdir(log_dir):
+            plot_convergence(log_dir,
+                             out_path=os.path.join(args.out_dir, f'convergence_{slug}.pdf'))
+            plot_val_curves(log_dir, metric=args.metric,
+                            out_path=os.path.join(args.out_dir, f'val_curve_{slug}.pdf'))
+        else:
+            print(f'[main] {log_dir} not found; skipping convergence plots for {name}')
 
     print(f'Figures written to {args.out_dir}/')
 
