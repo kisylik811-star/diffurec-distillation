@@ -42,7 +42,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     # DiffuRec args (subset that matters)
     p.add_argument('--dataset', default='amazon_beauty')
-    p.add_argument('--data_root', default='../DiffuRec/datasets/data')
+    p.add_argument('--data_root', default='../datasets/data')
     p.add_argument('--max_len', type=int, default=50)
     p.add_argument('--device', default='cuda')
     p.add_argument('--num_gpu', type=int, default=1)
