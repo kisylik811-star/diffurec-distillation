@@ -1,39 +1,46 @@
 """
 Convenience driver for the ablation studies described in the dissertation.
 
-The ablation protocol has two blocks:
+Two blocks are supported:
 
-  Block 1 — RACD components (the contribution itself).
+  Block 1 — RACD components (the contribution).
             Baseline = vanilla_cd. Variants:
               vanilla_cd, ndcg_only, margin_only, full_racd
-            Each variant is compared against vanilla_cd by paired Wilcoxon.
 
-  Block 2 — Design choices (justifying configuration, not contribution).
+  Block 2 — Design choices (justifying configuration of full_racd).
             Baseline = full_racd. Variants:
-              full_racd, with_ddim, with_eps, no_ema
-            Each variant is compared against full_racd by paired Wilcoxon.
-
-Block 2 requires variant flags (--solver, --parametrization, --use_ema) to be
-honoured by the student / trainer. Until those are wired up, only Block 1
-will run cleanly; Block 2 will train but the design knobs will fall back
-to defaults (a warning is printed at startup so this is obvious).
+              full_racd, with_heun, with_eps, no_ema
+            Each Block-2 variant flips ONE design knob from full_racd:
+              with_heun  -> solver=heun (was ddim)
+              with_eps   -> parametrization=eps (was xstart)
+              no_ema     -> use_ema=False (was True)
 
 Usage:
     PYTHONPATH=../DiffuRec/src python ablation_runner.py \
+        --block 1 \
         --dataset amazon_beauty \
         --teacher_ckpt checkpoints/teacher_amazon_beauty.pt \
-        --block 1 \
         --seeds 1997 42 2024 7 13 \
         --out_json results/ablation_block1_beauty.json
 
-After running, hand the resulting JSON to:
+    PYTHONPATH=../DiffuRec/src python ablation_runner.py \
+        --block 2 \
+        --dataset amazon_beauty \
+        --teacher_ckpt checkpoints/teacher_amazon_beauty.pt \
+        --seeds 1997 42 2024 \
+        --out_json results/ablation_block2_beauty.json
+
+Then derive tables / figures with:
 
     python statistics.py results/ablation_block1_beauty.json \
         --ablation_baseline vanilla_cd \
         --ablation_variants vanilla_cd ndcg_only margin_only full_racd \
         --out_ablation_latex tables/ablation_block1.tex
 
-    python plots.py --json_paths results/ablation_block1_beauty.json ...
+    python statistics.py results/ablation_block2_beauty.json \
+        --ablation_baseline full_racd \
+        --ablation_variants full_racd with_heun with_eps no_ema \
+        --out_ablation_latex tables/ablation_block2.tex
 """
 import argparse
 import subprocess
@@ -43,7 +50,12 @@ from pathlib import Path
 
 BLOCK_VARIANTS = {
     1: ['vanilla_cd', 'ndcg_only', 'margin_only', 'full_racd'],
-    2: ['full_racd', 'with_ddim', 'with_eps', 'no_ema'],
+    2: ['full_racd', 'with_heun', 'with_eps', 'no_ema'],
+}
+
+BLOCK_BASELINE = {
+    1: 'vanilla_cd',
+    2: 'full_racd',
 }
 
 
@@ -52,7 +64,6 @@ def parse_args():
     p.add_argument('--block', type=int, choices=[1, 2], required=True,
                    help='Which ablation block: 1 = RACD components, '
                         '2 = design choices.')
-    # All other args are forwarded verbatim to multi_seed_runner.
     p.add_argument('--dataset', required=True)
     p.add_argument('--teacher_ckpt', default=None)
     p.add_argument('--data_root', default='../datasets/data')
@@ -69,10 +80,11 @@ def parse_args():
 def main():
     args = parse_args()
     variants = BLOCK_VARIANTS[args.block]
-    if args.block == 2:
-        print('[ablation_runner] WARNING: Block 2 variants depend on solver / '
-              'parametrization / EMA switches in the student. Confirm the code '
-              'honours those overrides before relying on these results.')
+    baseline = BLOCK_BASELINE[args.block]
+
+    print(f'[ablation_runner] Block {args.block}')
+    print(f'  variants: {variants}')
+    print(f'  baseline (for paired-Wilcoxon): {baseline}')
 
     Path(Path(args.out_json).parent or '.').mkdir(parents=True, exist_ok=True)
 
@@ -93,6 +105,13 @@ def main():
 
     print('[ablation_runner] running:', ' '.join(cmd))
     rc = subprocess.call(cmd)
+
+    if rc == 0:
+        print(f'\n[ablation_runner] done. Next steps:')
+        print(f'  python statistics.py {args.out_json} \\')
+        print(f'    --ablation_baseline {baseline} \\')
+        print(f'    --ablation_variants {" ".join(variants)} \\')
+        print(f'    --out_ablation_latex tables/ablation_block{args.block}.tex')
     sys.exit(rc)
 
 

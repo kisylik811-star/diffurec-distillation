@@ -6,36 +6,33 @@ variants* with different random seeds, evaluating each at the requested
 NFE values. Also evaluates the teacher with truncated DDIM (the naive
 acceleration baseline) at the same NFEs.
 
-A "variant" is one configuration of the student loss (or other hyper-
-parameters): e.g. {'vanilla_cd', 'full_racd', '+ndcg_only', '+margin_only'}.
-For Block 1 ablation, one run with --variants 'vanilla_cd full_racd ndcg_only margin_only'
-gives you the whole table.
+Variant catalog (see VARIANT_CONFIGS below):
 
-Results JSON layout:
-{
-  'dataset':  ...,
-  'config':   {...},
-  'teacher':  {'full_nfe': {...metrics...}, 'T': T},
-  'baseline': {nfe -> {...metrics...}},   # truncated DDIM
-  'variants': {
-      variant_name -> { seed -> { nfe -> {metric -> float} } }
-  },
-  'latency':  {
-      'teacher_full': float,
-      'teacher_truncated': {nfe -> float},
-      'student': {variant_name -> {nfe -> float}},
-  }
-}
+  Block 1 — RACD components.
+    Baseline = vanilla_cd. Compare via paired Wilcoxon vs vanilla_cd.
+      vanilla_cd     reward off
+      ndcg_only      reward = ApproxNDCG
+      margin_only    reward = pairwise hard-neg margin
+      full_racd      reward = ApproxNDCG + margin
+
+  Block 2 — Design choices (justifying configuration of full_racd).
+    Baseline = full_racd. Compare via paired Wilcoxon vs full_racd.
+      full_racd      solver=ddim, parametrization=xstart, use_ema=True
+      with_heun      solver=heun (one knob flipped)
+      with_eps       parametrization=eps (one knob flipped)
+      no_ema         use_ema=False (one knob flipped)
+
+    All Block-2 variants keep the RACD reward on, so they are clean
+    leave-one-out modifications of full_racd.
 
 Usage:
-    PYTHONPATH=../DiffuRec/src python multi_seed_runner.py \
-        --dataset amazon_beauty \
-        --data_root ../DiffuRec/datasets/data \
-        --teacher_epochs 200 --distill_epochs 100 \
-        --seeds 1997 42 2024 7 13 \
-        --variants vanilla_cd full_racd \
-        --nfe_grid 1 2 4 8 16 32 \
-        --out_json results/beauty.json
+    PYTHONPATH=../DiffuRec/src python multi_seed_runner.py \\
+        --dataset amazon_beauty \\
+        --teacher_ckpt checkpoints/teacher_amazon_beauty.pt \\
+        --seeds 1997 42 2024 \\
+        --variants vanilla_cd full_racd \\
+        --nfe_grid 1 2 4 8 16 32 \\
+        --out_json results/beauty_main.json
 """
 import argparse
 import copy
@@ -60,35 +57,37 @@ from evaluation import evaluate_teacher_truncated, measure_latency_grid
 
 # ---------------------------------------------------------------- #
 #  Variant catalog                                                 #
-#                                                                  #
-#  A variant is a set of overrides applied to `args` before        #
-#  building the student. Add new variants here as you design more  #
-#  ablation experiments. The names below are the canonical strings #
-#  used elsewhere (in JSON keys and in plotting / stats code).     #
 # ---------------------------------------------------------------- #
+# Each entry is the set of overrides applied on top of CLI args
+# before constructing the student. Keys not listed here keep their
+# CLI-default value. The full set of student-recognised override
+# keys is:
+#   reward_weight, ndcg_weight, margin_weight, ndcg_alpha,
+#   hard_neg_k, margin_value, parametrization, solver, use_ema
+#
+# Defaults (mirrored from the CLI defaults in parse_args) are:
+#   parametrization = 'xstart',  solver = 'ddim',  use_ema = True
+
 VARIANT_CONFIGS = {
-    # Block 1: RACD components
+    # ----- Block 1: RACD components -----
     'vanilla_cd':  dict(reward_weight=0.0, ndcg_weight=0.0,  margin_weight=0.0),
     'ndcg_only':   dict(reward_weight=1.0, ndcg_weight=0.5,  margin_weight=0.0),
     'margin_only': dict(reward_weight=1.0, ndcg_weight=0.0,  margin_weight=0.5),
     'full_racd':   dict(reward_weight=1.0, ndcg_weight=0.5,  margin_weight=0.5),
 
-    # Block 2 placeholders — these require code-level switches in the
-    # student (parametrization, solver, EMA). They map to plain kwargs
-    # here; the student / trainer must read them. Until those switches
-    # are wired up, requesting these variants will raise.
-    'no_ema':      dict(reward_weight=1.0, ndcg_weight=0.5,  margin_weight=0.5,
-                        use_ema=False),
-    'with_ddim':   dict(reward_weight=1.0, ndcg_weight=0.5,  margin_weight=0.5,
-                        solver='ddim'),
-    'with_eps':    dict(reward_weight=1.0, ndcg_weight=0.5,  margin_weight=0.5,
+    # ----- Block 2: design choices (each flips ONE knob from full_racd) -----
+    'with_heun':   dict(reward_weight=1.0, ndcg_weight=0.5, margin_weight=0.5,
+                        solver='heun'),
+    'with_eps':    dict(reward_weight=1.0, ndcg_weight=0.5, margin_weight=0.5,
                         parametrization='eps'),
+    'no_ema':      dict(reward_weight=1.0, ndcg_weight=0.5, margin_weight=0.5,
+                        use_ema=False),
 }
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    # DiffuRec args (subset that matters)
+    # ----- DiffuRec args (subset that matters) -----
     p.add_argument('--dataset', default='amazon_beauty')
     p.add_argument('--data_root', default='../datasets/data')
     p.add_argument('--max_len', type=int, default=50)
@@ -121,13 +120,12 @@ def parse_args():
     p.add_argument('--diversity_measure', default=False)
     p.add_argument('--epoch_time_avg', default=False)
 
-    # Teacher
+    # ----- Teacher -----
     p.add_argument('--teacher_epochs', type=int, default=200)
-    p.add_argument('--teacher_ckpt', default=None,
-                   help='Reuse a pre-trained teacher checkpoint if provided.')
+    p.add_argument('--teacher_ckpt', default=None)
     p.add_argument('--save_teacher_ckpt', default='checkpoints/teacher_{dataset}.pt')
 
-    # Distillation defaults (variants override the reward fields)
+    # ----- Distillation defaults (variants override the relevant fields) -----
     p.add_argument('--distill_lr', type=float, default=1e-3)
     p.add_argument('--distill_epochs', type=int, default=200)
     p.add_argument('--distill_eval_interval', type=int, default=5)
@@ -135,7 +133,8 @@ def parse_args():
     p.add_argument('--cons_weight', type=float, default=1.0)
     p.add_argument('--ce_weight', type=float, default=1.0)
     p.add_argument('--ema_decay', type=float, default=0.95)
-    # Default reward config — variants override these.
+
+    # Reward defaults — variants override these.
     p.add_argument('--reward_weight', type=float, default=0.0)
     p.add_argument('--ndcg_weight', type=float, default=0.0)
     p.add_argument('--margin_weight', type=float, default=0.0)
@@ -143,16 +142,27 @@ def parse_args():
     p.add_argument('--hard_neg_k', type=int, default=16)
     p.add_argument('--margin_value', type=float, default=0.0)
 
-    # Multi-seed / multi-variant
+    # Block-2 design-switch defaults — variants override these.
+    p.add_argument('--parametrization', choices=['xstart', 'eps'], default='xstart',
+                   help='Interpretation of the network output: predicted x_0 '
+                        '(xstart, default) or predicted noise (eps).')
+    p.add_argument('--solver', choices=['ddim', 'heun'], default='ddim',
+                   help='Solver for the teacher target step. ddim is 1st-order '
+                        '(default, cheap); heun is 2nd-order (~2x cost per '
+                        'consistency step).')
+    p.add_argument('--use_ema', type=lambda s: str(s).lower() == 'true', default=True,
+                   help='Use EMA target network for the consistency target. '
+                        'Pass False to disable (no_ema variant).')
+
+    # ----- Multi-seed / multi-variant -----
     p.add_argument('--seeds', type=int, nargs='+', default=[1997, 42, 2024])
     p.add_argument('--teacher_seed', type=int, default=1997)
-    p.add_argument('--variants', nargs='+', default=['vanilla_cd', 'full_racd'],
-                   help='Variant names from VARIANT_CONFIGS to train.')
+    p.add_argument('--variants', nargs='+', default=['vanilla_cd', 'full_racd'])
     p.add_argument('--nfe_grid', type=int, nargs='+', default=[1, 2, 4, 8, 16, 32])
     p.add_argument('--out_json', default='results/multiseed.json')
 
     args = p.parse_args()
-    args.epochs = args.teacher_epochs  # used by trainer for teacher
+    args.epochs = args.teacher_epochs
     return args
 
 
@@ -177,7 +187,6 @@ def load_data(args):
 
 
 def apply_variant_overrides(base_args, variant_name):
-    """Return a fresh args namespace with the variant's overrides applied."""
     if variant_name not in VARIANT_CONFIGS:
         raise KeyError(f'Unknown variant: {variant_name}. '
                        f'Known: {list(VARIANT_CONFIGS.keys())}')
@@ -192,6 +201,16 @@ class _DummyLogger:
     def info(self, *a, **k): pass
 
 
+def _describe_variant(v_args):
+    """Compact one-line description of the active design switches."""
+    return (f"reward_weight={getattr(v_args, 'reward_weight', 0)} "
+            f"ndcg_weight={getattr(v_args, 'ndcg_weight', 0)} "
+            f"margin_weight={getattr(v_args, 'margin_weight', 0)} | "
+            f"parametrization={getattr(v_args, 'parametrization', 'xstart')} "
+            f"solver={getattr(v_args, 'solver', 'ddim')} "
+            f"use_ema={getattr(v_args, 'use_ema', True)}")
+
+
 def main():
     args = parse_args()
     args.save_teacher_ckpt = args.save_teacher_ckpt.format(dataset=args.dataset)
@@ -201,7 +220,6 @@ def main():
     device = torch.device(args.device)
     logger = _DummyLogger()
 
-    # ---- Load data once ----
     fix_seed(args.teacher_seed)
     tra_loader, val_loader, test_loader = load_data(args)
     print(f'[Data] {args.dataset}: item_num={args.item_num}')
@@ -218,7 +236,7 @@ def main():
         'latency':  {'student': {v: {} for v in args.variants}},
     }
 
-    # ---- Teacher (trained once, reused across variants and seeds) ----
+    # ---- Teacher (trained once, reused) ----
     teacher_ckpt = args.teacher_ckpt or args.save_teacher_ckpt
     teacher = Att_Diffuse_model(create_model_diffu(args), args).to(device)
     if os.path.exists(teacher_ckpt):
@@ -250,16 +268,11 @@ def main():
     for variant_name in args.variants:
         print(f'\n=========== Variant: {variant_name} ===========')
         v_args = apply_variant_overrides(args, variant_name)
-        # Surface the chosen reward weights for the log.
-        print(f'  reward: weight={getattr(v_args, "reward_weight", 0)} '
-              f'ndcg={getattr(v_args, "ndcg_weight", 0)} '
-              f'margin={getattr(v_args, "margin_weight", 0)}')
+        print('  ' + _describe_variant(v_args))
 
         for seed in args.seeds:
             print(f'\n--- variant={variant_name}  seed={seed} ---')
             fix_seed(seed)
-
-            # Reload data with this seed (reshuffles training order via DataLoader)
             tra_s, val_s, tst_s = load_data(v_args)
 
             student = ConsistencyStudent(teacher, v_args,
@@ -267,7 +280,6 @@ def main():
             best_student = distill_train(student, teacher, tra_s, val_s, tst_s,
                                          v_args, logger)
 
-            # Evaluate at all NFE
             seed_results = {}
             for nfe in args.nfe_grid:
                 m = evaluate_at_nfe(best_student, tst_s, num_steps=nfe, device=device)
@@ -275,18 +287,15 @@ def main():
                 print(f'  variant={variant_name} seed={seed} NFE={nfe}: {m}')
             results['variants'][variant_name][str(seed)] = seed_results
 
-            last_student = best_student  # used for latency below
+            last_student = best_student
 
-        # ---- Latency for this variant (one batch is enough) ----
         sample_batch = next(iter(test_loader))
         lat = measure_latency_grid(teacher, last_student, sample_batch, device,
                                    args.nfe_grid)
         results['latency']['student'][variant_name] = lat['student']
-        # teacher_full / teacher_truncated are variant-independent
         results['latency'].setdefault('teacher_full', lat['teacher_full'])
         results['latency'].setdefault('teacher_truncated', lat['teacher_truncated'])
 
-    # ---- Persist ----
     with open(args.out_json, 'w') as f:
         json.dump(results, f, indent=2, default=float)
     print(f'\n[Done] results -> {args.out_json}')
