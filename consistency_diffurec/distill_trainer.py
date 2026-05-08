@@ -1,4 +1,4 @@
-"""Training loop and evaluation utilities for consistency distillation."""
+"""Training loop and evaluation utilities for consistency distillation (RACD)."""
 import copy
 import time
 import numpy as np
@@ -66,14 +66,23 @@ def measure_inference_latency(model, sample_batch, device, num_steps=None,
     return elapsed_ms / seq.size(0)
 
 
-def distill_train(student, teacher_diffu, train_loader, val_loader, test_loader, args, logger):
-    """Train the student via consistency distillation against a frozen teacher."""
+def distill_train(student, teacher_model, train_loader, val_loader, test_loader,
+                  args, logger):
+    """
+    Train the student via (Reward-Aware) Consistency Distillation against a
+    frozen teacher.
+
+    `teacher_model` is the full Att_Diffuse_model (not just teacher_diffu),
+    because reward mining (margin term) needs teacher.item_embeddings as well
+    as teacher.diffu.
+    """
     device = torch.device(args.device)
     student = student.to(device)
 
-    teacher_diffu.eval()
-    for p in teacher_diffu.parameters():
+    teacher_model.eval()
+    for p in teacher_model.parameters():
         p.requires_grad = False
+    teacher_diffu = teacher_model.diffu
 
     optimizer = optim.Adam(student.parameters(), lr=args.distill_lr)
 
@@ -81,24 +90,32 @@ def distill_train(student, teacher_diffu, train_loader, val_loader, test_loader,
     best_student = None
     bad_count = 0
 
+    cons_w   = float(getattr(args, 'cons_weight', 1.0))
+    ce_w     = float(getattr(args, 'ce_weight', 1.0))
+    reward_w = float(getattr(args, 'reward_weight', 1.0))
+
     for epoch in range(args.distill_epochs):
         student.train()
-        running_cons, running_ce, n_b = 0.0, 0.0, 0
+        running_cons, running_ce, running_rwd, n_b = 0.0, 0.0, 0.0, 0
         for batch in train_loader:
             seq, target = [x.to(device) for x in batch]
             optimizer.zero_grad()
-            cons_loss, ce_loss = student.consistency_loss(seq, target, teacher_diffu)
-            loss = args.cons_weight * cons_loss + args.ce_weight * ce_loss
+            cons_loss, ce_loss, reward_loss = student.consistency_loss(
+                seq, target, teacher_diffu, teacher_model=teacher_model
+            )
+            loss = cons_w * cons_loss + ce_w * ce_loss + reward_w * reward_loss
             loss.backward()
             optimizer.step()
             student.update_ema()
-            running_cons += cons_loss.item()
-            running_ce += ce_loss.item()
+            running_cons += float(cons_loss.detach())
+            running_ce   += float(ce_loss.detach())
+            running_rwd  += float(reward_loss.detach())
             n_b += 1
 
         msg = (f'[Distill][Epoch {epoch}] '
                f'cons={running_cons / max(n_b, 1):.4f} '
-               f'ce={running_ce / max(n_b, 1):.4f}')
+               f'ce={running_ce / max(n_b, 1):.4f} '
+               f'reward={running_rwd / max(n_b, 1):.4f}')
         print(msg)
         logger.info(msg)
 
