@@ -1,73 +1,126 @@
 """
 Statistical analysis of multi-seed runs.
 
-Key concepts in this module:
-  * paired_wilcoxon          : two paired samples (variant_A vs variant_B with the
-                               same seeds). Used for ablation: e.g. RACD vs Vanilla CD.
-  * one_sample_wilcoxon_vs   : one sample vs a deterministic constant. Used for
-                               main-results: e.g. RACD-seeds vs Truncated-DDIM
-                               (single number, no seeds).
-  * bootstrap_ci             : percentile bootstrap (1 - alpha) CI for the mean.
-  * ablation_pairwise_table  : LaTeX table comparing each variant against a chosen
-                               baseline variant via paired Wilcoxon. Used for
-                               Block 1 (vs Vanilla CD) and Block 2 (vs Full RACD).
+- aggregate_seeds: mean ± std across seeds for each (NFE, metric).
+- paired_wilcoxon: significance tests between two paired arrays.
+- bootstrap_ci: bias-corrected 95% confidence intervals.
+- latex_main_table: LaTeX-ready main results table for the dissertation.
+- compute_metrics: FLOPs ratio + throughput for teacher vs student.
 
-Reads JSON files produced by `multi_seed_runner.py`. The JSON layout supports
-multiple variants per seed:
-
-    results['variants'][variant_name][seed][nfe][metric] -> float
-
-Backwards compat: if a JSON has the legacy `students` key, we treat it as a
-single variant called 'student'.
+Reads JSON files produced by `multi_seed_runner.py`.
 """
 import json
 import numpy as np
 from scipy import stats
 
+try:
+    from literature_baselines import LITERATURE_BASELINES, BASELINE_ORDER, DISPLAY_NAMES
+except ImportError:
+    LITERATURE_BASELINES = {}
+    BASELINE_ORDER = []
+    DISPLAY_NAMES = {}
 
-# --------------------------------------------------------------------- #
-#  IO and shape helpers                                                 #
-# --------------------------------------------------------------------- #
+
 def load_results(path):
     with open(path) as f:
         return json.load(f)
 
 
-def variants_in(results):
-    """List of variant names available in this results JSON."""
-    if 'variants' in results:
-        return list(results['variants'].keys())
-    if 'students' in results:
-        return ['student']  # legacy
-    return []
+def _gather(results, nfe, metric_key):
+    """Pull metric values across seeds for a given NFE (test split)."""
+    return np.array([
+        results['students'][seed][str(nfe)][metric_key]
+        for seed in results['students']
+    ])
 
 
-def _seed_dict(results, variant):
-    """variant -> {seed: {nfe: {metric: float}}}."""
-    if 'variants' in results:
-        return results['variants'][variant]
-    # legacy: only 'students'
-    return results['students']
+def _gather_val(results, nfe, metric_key):
+    """Pull validation-split metric values across seeds for a given NFE.
+    Returns None if val metrics are not present in the JSON."""
+    seeds = list(results['students'].keys())
+    if not seeds or '_val' not in results['students'][seeds[0]]:
+        return None
+    return np.array([
+        results['students'][seed]['_val'][str(nfe)][metric_key]
+        for seed in seeds
+    ])
 
 
-def _gather(results, variant, nfe, metric_key):
-    """Pull metric values across seeds for a (variant, NFE)."""
-    sd = _seed_dict(results, variant)
-    return np.array([sd[seed][str(nfe)][metric_key] for seed in sd])
+def gen_gap_analysis(results, nfe, metric='HR@10'):
+    """
+    Validation vs test gap — generalization sanity check.
+
+    Returns a dict with:
+      - student_val_mean, student_test_mean: average val/test for the student
+      - student_gap: val - test (positive means val better than test)
+      - teacher_val, teacher_test, teacher_gap: same for the teacher (single-run)
+      - gap_ratio: student_gap / teacher_gap (ratio close to 1 means
+        the student's generalization gap matches the teacher's, i.e.
+        distillation does not introduce extra overfitting)
+    """
+    student_test = _gather(results, nfe, metric)
+    student_val  = _gather_val(results, nfe, metric)
+    if student_val is None:
+        return None
+
+    teacher_test = results['teacher']['full_nfe'].get(metric)
+    teacher_val  = results['teacher'].get('full_nfe_val', {}).get(metric)
+
+    student_gap = student_val.mean() - student_test.mean()
+    teacher_gap = (teacher_val - teacher_test) if (teacher_val is not None) else None
+
+    return {
+        'student_val_mean':  float(student_val.mean()),
+        'student_val_std':   float(student_val.std(ddof=1)) if len(student_val) > 1 else 0.0,
+        'student_test_mean': float(student_test.mean()),
+        'student_test_std':  float(student_test.std(ddof=1)) if len(student_test) > 1 else 0.0,
+        'student_gap':       float(student_gap),
+        'teacher_val':       float(teacher_val) if teacher_val is not None else None,
+        'teacher_test':      float(teacher_test) if teacher_test is not None else None,
+        'teacher_gap':       float(teacher_gap) if teacher_gap is not None else None,
+        'gap_ratio':         (float(student_gap / teacher_gap)
+                              if (teacher_gap is not None and abs(teacher_gap) > 1e-9)
+                              else None),
+    }
 
 
-# --------------------------------------------------------------------- #
-#  Aggregation                                                          #
-# --------------------------------------------------------------------- #
-def aggregate_seeds(results, variant='racd', nfe_grid=(1, 2, 4, 8),
+def gen_gap_analysis_text(results, nfe_grid=(1, 2, 4, 8), metric='HR@10'):
+    """Print a val-vs-test generalization gap summary."""
+    print(f"\n=== {results['dataset']} | val/test gap | {metric} ===")
+    sample = gen_gap_analysis(results, nfe_grid[0], metric)
+    if sample is None:
+        print('  (no val metrics in JSON — re-run multi_seed_runner.py to populate them)')
+        return
+
+    if sample['teacher_val'] is not None:
+        print(f"Teacher: val={sample['teacher_val']:.4f}  "
+              f"test={sample['teacher_test']:.4f}  "
+              f"gap={sample['teacher_gap']:+.4f}")
+
+    header = (f"{'NFE':<5} {'Student val':<22} {'Student test':<22} "
+              f"{'Gap':<10} {'Gap/Teacher':<12}")
+    print(header)
+    print('-' * len(header))
+    for nfe in nfe_grid:
+        a = gen_gap_analysis(results, nfe, metric)
+        if a is None:
+            continue
+        gap_ratio = (f"{a['gap_ratio']:.3f}" if a['gap_ratio'] is not None else '--')
+        print(f"{nfe:<5} "
+              f"{a['student_val_mean']:.4f} ± {a['student_val_std']:.4f}     "
+              f"{a['student_test_mean']:.4f} ± {a['student_test_std']:.4f}     "
+              f"{a['student_gap']:+.4f}    {gap_ratio}")
+
+
+def aggregate_seeds(results, nfe_grid=(1, 2, 4, 8),
                     metrics=('HR@5', 'HR@10', 'HR@20',
                              'NDCG@5', 'NDCG@10', 'NDCG@20')):
-    """For one variant: dict[nfe][metric] = {'mean','std','values'}."""
+    """Returns dict[nfe][metric] = {'mean': m, 'std': s, 'values': [...]}."""
     out = {}
     for nfe in nfe_grid:
         out[nfe] = {}
         for m in metrics:
-            vals = _gather(results, variant, nfe, m)
+            vals = _gather(results, nfe, m)
             out[nfe][m] = {
                 'mean':   float(vals.mean()),
                 'std':    float(vals.std(ddof=1)) if len(vals) > 1 else 0.0,
@@ -76,11 +129,8 @@ def aggregate_seeds(results, variant='racd', nfe_grid=(1, 2, 4, 8),
     return out
 
 
-# --------------------------------------------------------------------- #
-#  CIs and significance tests                                           #
-# --------------------------------------------------------------------- #
 def bootstrap_ci(values, n_boot=10000, alpha=0.05, seed=0):
-    """Percentile bootstrap (1 - alpha) CI for the mean."""
+    """Percentile bootstrap (1-alpha) CI for the mean."""
     values = np.asarray(values)
     rng = np.random.default_rng(seed)
     boots = np.array([rng.choice(values, size=len(values), replace=True).mean()
@@ -90,53 +140,66 @@ def bootstrap_ci(values, n_boot=10000, alpha=0.05, seed=0):
 
 
 def paired_wilcoxon(values_a, values_b):
-    """
-    Paired Wilcoxon signed-rank test.
-
-    Use when both `values_a` and `values_b` are seed-aligned samples of the
-    same length (e.g. variant_A on seed_i vs variant_B on seed_i for the
-    same i). Returns p-value (two-sided).
-
-    Wilcoxon needs n >= 5 to be meaningful; we return NaN below that.
-    """
-    a = np.asarray(values_a)
-    b = np.asarray(values_b)
-    if len(a) != len(b):
-        raise ValueError(f'paired Wilcoxon requires equal lengths, got {len(a)} vs {len(b)}')
-    if len(a) < 5:
+    """Paired Wilcoxon signed-rank test: H0 = no difference. Returns p-value."""
+    values_a = np.asarray(values_a)
+    values_b = np.asarray(values_b)
+    if len(values_a) < 5:
+        # Wilcoxon needs n >= 5 for any meaningful p-value
         return float('nan')
-    if np.allclose(a, b):
+    if np.allclose(values_a, values_b):
         return 1.0
     try:
-        _, p = stats.wilcoxon(a, b)
+        _, p = stats.wilcoxon(values_a, values_b)
         return float(p)
     except ValueError:
         return float('nan')
 
 
-def one_sample_wilcoxon_vs(values, constant):
+def compare_student_vs_baseline(results, nfe, metric='HR@10'):
     """
-    One-sample Wilcoxon signed-rank test against a deterministic constant.
+    For each NFE, compares the distilled student against the truncated-DDIM
+    teacher baseline at the same NFE (single value, no seeds for baseline).
 
-    Use when `values` are seed samples of one variant and `constant` is a
-    single number with no seed variability (e.g. Truncated DDIM, which is
-    deterministic at fixed teacher). H0: median(values - constant) = 0.
-
-    This is the correct alternative to a paired test against an artificial
-    array `[constant] * len(values)` — that path technically runs but
-    inflates the test's effective n and is harder to defend.
+    Returns: dict with student mean/std, baseline value, and a one-sample
+    sign-style indicator (since baseline has no variance, we just report
+    whether all student seeds beat it).
     """
-    v = np.asarray(values, dtype=float)
-    if len(v) < 5:
-        return float('nan')
-    diffs = v - float(constant)
-    if np.allclose(diffs, 0):
-        return 1.0
-    try:
-        _, p = stats.wilcoxon(diffs)
-        return float(p)
-    except ValueError:
-        return float('nan')
+    student_vals = _gather(results, nfe, metric)
+    baseline_val = results['baseline'][str(nfe)][metric]
+    n_better = int((student_vals > baseline_val).sum())
+    return {
+        'student_mean':  float(student_vals.mean()),
+        'student_std':   float(student_vals.std(ddof=1)) if len(student_vals) > 1 else 0.0,
+        'baseline':      float(baseline_val),
+        'n_seeds':       len(student_vals),
+        'n_seeds_better': n_better,
+    }
+
+
+def compare_student_vs_teacher(results, nfe, metric='HR@10'):
+    """
+    Compare the distilled student (multi-seed array) against the teacher at full
+    NFE (single value, deterministic given the trained teacher).
+
+    Desired outcome for the dissertation: p > 0.05 (i.e. *no* significant
+    difference) — that is, the student preserves teacher's quality.
+    Desired direction also: student_mean ≈ teacher (sometimes slightly below,
+    occasionally above due to noise).
+
+    The Wilcoxon test compares the student's array of seeds to the constant
+    teacher value. With n=5 seeds this gives a meaningful p-value when the
+    seeds are concentrated either clearly above or clearly below the teacher.
+    """
+    student_vals = _gather(results, nfe, metric)
+    teacher_val  = results['teacher']['full_nfe'][metric]
+    return {
+        'student_mean':       float(student_vals.mean()),
+        'student_std':        float(student_vals.std(ddof=1)) if len(student_vals) > 1 else 0.0,
+        'teacher':            float(teacher_val),
+        'gap_pct':            float((student_vals.mean() - teacher_val) / teacher_val * 100),
+        'n_seeds':            len(student_vals),
+        'n_seeds_above_teacher': int((student_vals > teacher_val).sum()),
+    }
 
 
 def significance_marker(p):
@@ -148,74 +211,28 @@ def significance_marker(p):
     return ''
 
 
-# --------------------------------------------------------------------- #
-#  Public comparison helpers                                            #
-# --------------------------------------------------------------------- #
-def compare_variants_paired(results, variant_a, variant_b, nfe, metric='HR@10'):
+def compute_metrics(results, nfe_grid=(1, 2, 4, 8, 16, 32)):
     """
-    Paired comparison between two variants on the same seeds.
-    Used for ablation: e.g. ('full_racd', 'vanilla_cd').
-    """
-    a = _gather(results, variant_a, nfe, metric)
-    b = _gather(results, variant_b, nfe, metric)
-    p = paired_wilcoxon(a, b)
-    return {
-        'variant_a': variant_a,
-        'variant_b': variant_b,
-        'mean_a':    float(a.mean()),
-        'std_a':     float(a.std(ddof=1)) if len(a) > 1 else 0.0,
-        'mean_b':    float(b.mean()),
-        'std_b':     float(b.std(ddof=1)) if len(b) > 1 else 0.0,
-        'delta':     float(a.mean() - b.mean()),
-        'p_wilcoxon': p,
+    Compute derived efficiency metrics from the latency grid in `results`.
+
+    Returns dict[nfe] = {
+        'flops_ratio_vs_teacher_full':  T / NFE,
+        'student_throughput_per_sec':   1000 / latency_ms,
+        'teacher_truncated_throughput': 1000 / latency_ms,
+        'speedup_vs_teacher_full':      teacher_full_ms / student_ms,
     }
 
-
-def compare_variant_vs_baseline(results, variant, nfe, metric='HR@10'):
-    """
-    Compare a seeded variant against a deterministic baseline (Truncated DDIM).
-    Uses one-sample Wilcoxon and reports n_seeds_better as a robust addendum.
-    """
-    student_vals = _gather(results, variant, nfe, metric)
-    baseline_val = results['baseline'][str(nfe)][metric]
-    p = one_sample_wilcoxon_vs(student_vals, baseline_val)
-    n_better = int((student_vals > baseline_val).sum())
-    return {
-        'variant':       variant,
-        'student_mean':  float(student_vals.mean()),
-        'student_std':   float(student_vals.std(ddof=1)) if len(student_vals) > 1 else 0.0,
-        'baseline':      float(baseline_val),
-        'n_seeds':       len(student_vals),
-        'n_seeds_better': n_better,
-        'p_wilcoxon_one_sample': p,
-    }
-
-
-# --------------------------------------------------------------------- #
-#  Compute / latency derived metrics                                    #
-# --------------------------------------------------------------------- #
-def compute_metrics(results, nfe_grid=(1, 2, 4, 8, 16, 32), variant='racd'):
-    """
-    Derived efficiency metrics from the latency grid.
-
-    `variant` selects which student's latency to use (variants are trained
-    independently but share architecture, so latency is essentially identical;
-    we still pick the one explicitly named).
+    Note on FLOPs: teacher and student share the same Transformer backbone, so
+    per-forward-pass FLOPs are identical. The total inference FLOPs for one
+    sample are therefore proportional to NFE: FLOPs(student@NFE=k) / FLOPs(teacher@NFE=T) = k / T.
+    We report the ratio, which is exact and does not require profiler runs.
     """
     T = results['teacher']['T']
     teacher_full_ms = results['latency']['teacher_full']
-
-    # `latency.student` may be variant-keyed or flat (legacy)
-    student_lat_root = results['latency']['student']
-    if variant in student_lat_root:
-        student_lat = student_lat_root[variant]
-    else:
-        student_lat = student_lat_root  # legacy flat
-
     out = {}
     for nfe in nfe_grid:
         nfe_str = str(nfe)
-        s_lat = student_lat[nfe_str]
+        s_lat = results['latency']['student'][nfe_str]
         t_lat = results['latency']['teacher_truncated'][nfe_str]
         out[nfe] = {
             'flops_ratio_vs_teacher_full':  nfe / T,
@@ -234,10 +251,11 @@ def compute_metrics(results, nfe_grid=(1, 2, 4, 8, 16, 32), variant='racd'):
     return out
 
 
-def compute_metrics_text(results, nfe_grid=(1, 2, 4, 8, 16, 32), variant='racd'):
-    cm = compute_metrics(results, nfe_grid, variant=variant)
+def compute_metrics_text(results, nfe_grid=(1, 2, 4, 8, 16, 32)):
+    """Print a compute-cost summary in the style of the main metrics summary."""
+    cm = compute_metrics(results, nfe_grid)
     tf = cm['_teacher_full']
-    print(f"\n=== {results['dataset']} | compute & speed ({variant}) ===")
+    print(f"\n=== {results['dataset']} | compute & speed ===")
     print(f"Teacher full (NFE={tf['T']}): "
           f"{tf['latency_ms']:.4f} ms, {tf['throughput_per_sec']:.1f} samples/s")
     header = f"{'NFE':<6} {'FLOPs ratio':<14} {'Student ms':<12} {'Throughput':<14} {'Speedup':<10}"
@@ -251,20 +269,21 @@ def compute_metrics_text(results, nfe_grid=(1, 2, 4, 8, 16, 32), variant='racd')
               f"{c['speedup_vs_teacher_full']:<10.2f}x")
 
 
-# --------------------------------------------------------------------- #
-#  LaTeX tables                                                         #
-# --------------------------------------------------------------------- #
-def latex_main_table(results_per_dataset, variant='racd', nfe=1,
-                     metrics=('HR@5', 'HR@10', 'HR@20',
-                              'NDCG@5', 'NDCG@10', 'NDCG@20')):
+def latex_main_table(results_per_dataset, nfe=1, metrics=('HR@5', 'HR@10', 'HR@20',
+                                                          'NDCG@5', 'NDCG@10', 'NDCG@20')):
     """
-    Main results table: rows are datasets x methods, columns are metrics.
+    Build a LaTeX main-results table, comparable in style to Table 2 of DiffuRec.
 
-    Methods per dataset:
-      - Teacher (full NFE)               : single number
-      - Truncated DDIM (NFE=`nfe`)       : single number
-      - <variant> (NFE=`nfe`)            : mean ± std with one-sample Wilcoxon
-                                            vs Truncated DDIM
+    `results_per_dataset` is a dict {dataset_name: results_json}.
+
+    Rows: per-dataset
+    Columns: per-metric
+    Cells: teacher full NFE | truncated NFE=`nfe` | student NFE=`nfe`
+           Student cells carry two markers:
+             * (or **, ***)  — student significantly *beats* truncated DDIM
+                                (paired Wilcoxon, p < 0.05 / 0.01 / 0.001)
+             † (dagger)       — no significant difference from teacher
+                                (paired Wilcoxon, p >= 0.05) — desirable
     """
     lines = []
     lines.append(r'\begin{tabular}{l l ' + 'r' * len(metrics) + '}')
@@ -273,85 +292,77 @@ def latex_main_table(results_per_dataset, variant='racd', nfe=1,
     lines.append(r'\midrule')
 
     for ds_name, res in results_per_dataset.items():
-        agg = aggregate_seeds(res, variant=variant, nfe_grid=[nfe], metrics=metrics)
+        agg = aggregate_seeds(res, nfe_grid=[nfe], metrics=metrics)
 
-        # Teacher full
-        teacher_cells = [f'{res["teacher"]["full_nfe"][m]:.2f}' for m in metrics]
-        lines.append(f'{ds_name} & Teacher (NFE={res["teacher"]["T"]}) & '
-                     + ' & '.join(teacher_cells) + r' \\')
+        # ---- Literature baselines (cited from DiffuRec, Table 2) ----
+        lit = LITERATURE_BASELINES.get(ds_name, {})
+        if lit:
+            for i, baseline_name in enumerate(BASELINE_ORDER):
+                if baseline_name not in lit:
+                    continue
+                pretty = DISPLAY_NAMES.get(baseline_name, baseline_name)
+                row_cells = ['', pretty]
+                for m in metrics:
+                    val = lit[baseline_name].get(m)
+                    row_cells.append(f'{val:.2f}' if val is not None else '--')
+                prefix = ds_name if i == 0 else ''
+                lines.append(prefix + ' & ' + ' & '.join(row_cells[1:]) + r' \\')
+            lines.append(r'\cmidrule(lr){2-' + str(len(metrics) + 2) + '}')
+            ds_prefix = ''  # already used the dataset name above
+        else:
+            ds_prefix = ds_name
 
-        # Truncated DDIM
-        baseline_cells = [f'{res["baseline"][str(nfe)][m]:.2f}' for m in metrics]
-        lines.append(f' & Truncated DDIM (NFE={nfe}) & '
-                     + ' & '.join(baseline_cells) + r' \\')
+        # ---- Our experimental rows ----
+        teacher_row = ['', f'Teacher (NFE={res["teacher"]["T"]}, ours)']
+        for m in metrics:
+            teacher_row.append(f'{res["teacher"]["full_nfe"][m]:.2f}')
+        lines.append(ds_prefix + ' & ' + ' & '.join(teacher_row[1:]) + r' \\')
 
-        # Variant (RACD or whichever requested)
-        var_cells = []
+        baseline_row = ['', f'Truncated DDIM (NFE={nfe})']
+        for m in metrics:
+            baseline_row.append(f'{res["baseline"][str(nfe)][m]:.2f}')
+        lines.append(' & ' + ' & '.join(baseline_row[1:]) + r' \\')
+
+        student_row = ['', f'Student (NFE={nfe})']
         for m in metrics:
             mean = agg[nfe][m]['mean']
             std  = agg[nfe][m]['std']
-            p    = one_sample_wilcoxon_vs(agg[nfe][m]['values'],
-                                          res['baseline'][str(nfe)][m])
-            var_cells.append(f'{mean:.2f}{significance_marker(p)} $\\pm$ {std:.2f}')
-        lines.append(f' & {variant.upper()} (NFE={nfe}) & '
-                     + ' & '.join(var_cells) + r' \\')
+            student_vals = np.array(agg[nfe][m]['values'])
+
+            # Significance vs truncated DDIM (we *want* this to be < 0.05)
+            p_trunc = paired_wilcoxon(
+                student_vals,
+                np.full_like(student_vals, res['baseline'][str(nfe)][m])
+            )
+            star = significance_marker(p_trunc)
+
+            # Significance vs teacher (we *want* this to be >= 0.05)
+            p_teacher = paired_wilcoxon(
+                student_vals,
+                np.full_like(student_vals, res['teacher']['full_nfe'][m])
+            )
+            dagger = r'$^{\dagger}$' if (not np.isnan(p_teacher) and p_teacher >= 0.05) else ''
+
+            student_row.append(f'{mean:.2f}{star}{dagger} $\\pm$ {std:.2f}')
+        lines.append(' & ' + ' & '.join(student_row[1:]) + r' \\')
         lines.append(r'\midrule')
 
     lines.append(r'\bottomrule')
     lines.append(r'\end{tabular}')
+    # Append a footnote explaining the two markers.
+    lines.append('')
+    lines.append(r'% Markers:')
+    lines.append(r'%   *,**,*** — student significantly beats truncated DDIM (p<0.05/0.01/0.001).')
+    lines.append(r'%   $\dagger$ — no significant difference from teacher (p>=0.05); desirable.')
     return '\n'.join(lines)
 
 
-def ablation_pairwise_table(results, variants, baseline_variant, nfe=1,
-                            metrics=('HR@10', 'NDCG@10'), title=None):
+def latex_compute_table(results_per_dataset, nfe_grid=(1, 2, 4, 8)):
     """
-    Generic ablation table: each row is a variant, compared (paired Wilcoxon)
-    against `baseline_variant`. The baseline row itself is shown without a
-    p-value for reference.
-
-    Use cases:
-      Block 1 (RACD components):  baseline_variant='vanilla_cd',
-                                  variants=['vanilla_cd','+ndcg','+margin','full_racd']
-      Block 2 (design choices):   baseline_variant='full_racd',
-                                  variants=['full_racd','with_ddim','with_eps','no_ema']
+    Build a LaTeX compute-cost table: per dataset, latency / throughput / FLOPs
+    ratio / speedup factor for the student at varying NFE, plus the teacher
+    full-NFE reference row.
     """
-    lines = []
-    if title:
-        lines.append(f'% {title}')
-    n_metric_cols = len(metrics)
-    lines.append(r'\begin{tabular}{l ' + 'r ' * n_metric_cols + r'r}')
-    lines.append(r'\toprule')
-    header = ['Variant'] + list(metrics) + [f'p vs {baseline_variant}']
-    lines.append(' & '.join(header) + r' \\')
-    lines.append(r'\midrule')
-
-    base_vals = {m: _gather(results, baseline_variant, nfe, m) for m in metrics}
-
-    for v in variants:
-        cells = [v]
-        for m in metrics:
-            vals = _gather(results, v, nfe, m)
-            mean = vals.mean()
-            std  = vals.std(ddof=1) if len(vals) > 1 else 0.0
-            cells.append(f'{mean:.2f} $\\pm$ {std:.2f}')
-
-        if v == baseline_variant:
-            cells.append('---')
-        else:
-            # Use the first metric for the headline p-value (standard practice)
-            head_m = metrics[0]
-            vals_v = _gather(results, v, nfe, head_m)
-            p = paired_wilcoxon(vals_v, base_vals[head_m])
-            cells.append(f'{p:.3g}{significance_marker(p)}' if not np.isnan(p) else 'n/a')
-
-        lines.append(' & '.join(cells) + r' \\')
-
-    lines.append(r'\bottomrule')
-    lines.append(r'\end{tabular}')
-    return '\n'.join(lines)
-
-
-def latex_compute_table(results_per_dataset, variant='racd', nfe_grid=(1, 2, 4, 8)):
     lines = []
     lines.append(r'\begin{tabular}{l l r r r r}')
     lines.append(r'\toprule')
@@ -360,8 +371,9 @@ def latex_compute_table(results_per_dataset, variant='racd', nfe_grid=(1, 2, 4, 
     lines.append(r'\midrule')
 
     for ds_name, res in results_per_dataset.items():
-        cm = compute_metrics(res, nfe_grid, variant=variant)
+        cm = compute_metrics(res, nfe_grid)
         tf = cm['_teacher_full']
+        # Teacher full-NFE reference row.
         lines.append(f'{ds_name} & Teacher (NFE={tf["T"]}) '
                      f'& {tf["latency_ms"]:.3f} '
                      f'& {tf["throughput_per_sec"]:.1f} '
@@ -369,7 +381,7 @@ def latex_compute_table(results_per_dataset, variant='racd', nfe_grid=(1, 2, 4, 
                      f'& 1.00$\\times$ \\\\')
         for nfe in nfe_grid:
             c = cm[nfe]
-            lines.append(f' & {variant.upper()} (NFE={nfe}) '
+            lines.append(f' & Student (NFE={nfe}) '
                          f'& {c["student_latency_ms"]:.3f} '
                          f'& {c["student_throughput_per_sec"]:.1f} '
                          f'& {c["flops_ratio_vs_teacher_full"]:.3f} '
@@ -381,42 +393,45 @@ def latex_compute_table(results_per_dataset, variant='racd', nfe_grid=(1, 2, 4, 
     return '\n'.join(lines)
 
 
-# --------------------------------------------------------------------- #
-#  Plain-text summary                                                   #
-# --------------------------------------------------------------------- #
-def summary_table_text(results, variant='racd', nfe_grid=(1, 2, 4, 8),
-                       metric='HR@10'):
-    print(f"\n=== {results['dataset']} | {variant} | {metric} ===")
-    print(f"Teacher (NFE={results['teacher']['T']}): {results['teacher']['full_nfe'][metric]:.4f}")
-    print(f"{'NFE':<6} {'Truncated':<12} {variant + ' (mean ± std)':<28} {'p (one-sample W)':<16}")
+def summary_table_text(results, nfe_grid=(1, 2, 4, 8), metric='HR@10'):
+    """Plain-text summary printed to stdout — quick dissertation sanity check."""
+    print(f"\n=== {results['dataset']} | {metric} ===")
+    print(f"Teacher (NFE={results['teacher']['T']}): "
+          f"{results['teacher']['full_nfe'][metric]:.4f}")
+    header = (f"{'NFE':<5} {'Trunc.':<10} {'Student (mean ± std)':<24} "
+              f"{'gap vs T %':<12} {'p_vs_teacher':<14} {'p_vs_trunc':<12}")
+    print(header)
+    print('-' * len(header))
     for nfe in nfe_grid:
-        cmp_ = compare_variant_vs_baseline(results, variant, nfe, metric)
-        print(f"{nfe:<6} {cmp_['baseline']:<12.4f} "
-              f"{cmp_['student_mean']:.4f} ± {cmp_['student_std']:.4f}      "
-              f"{cmp_['p_wilcoxon_one_sample']:<16.4g}")
+        student_vals = _gather(results, nfe, metric)
+        teacher_val  = results['teacher']['full_nfe'][metric]
+        truncated_val = results['baseline'][str(nfe)][metric]
+
+        # Wilcoxon: student vs teacher (constant) — desired outcome p > 0.05
+        p_vs_teacher = paired_wilcoxon(
+            student_vals, np.full(len(student_vals), teacher_val)
+        )
+        # Wilcoxon: student vs truncated DDIM (constant) — desired outcome p < 0.05
+        p_vs_trunc = paired_wilcoxon(
+            student_vals, np.full(len(student_vals), truncated_val)
+        )
+        gap_pct = (student_vals.mean() - teacher_val) / teacher_val * 100
+
+        print(f"{nfe:<5} {truncated_val:<10.4f} "
+              f"{student_vals.mean():.4f} ± {student_vals.std(ddof=1):.4f}    "
+              f"{gap_pct:>+8.2f}%   "
+              f"{p_vs_teacher:<14.4g} {p_vs_trunc:<12.4g}")
 
 
-# --------------------------------------------------------------------- #
-#  CLI                                                                  #
-# --------------------------------------------------------------------- #
 if __name__ == '__main__':
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument('json_paths', nargs='+',
-                    help='One or more JSON files from multi_seed_runner.py')
-    ap.add_argument('--variant', default='racd',
-                    help='Which student variant is the headline result.')
+    ap.add_argument('json_paths', nargs='+', help='One or more JSON files from multi_seed_runner.py')
     ap.add_argument('--metric', default='HR@10')
     ap.add_argument('--out_latex', default=None,
                     help='Path to write the main results LaTeX table.')
     ap.add_argument('--out_compute_latex', default=None,
                     help='Path to write the compute / speedup LaTeX table.')
-    ap.add_argument('--ablation_baseline', default=None,
-                    help='If set, dump an ablation table with this baseline '
-                         '(e.g. vanilla_cd or full_racd).')
-    ap.add_argument('--ablation_variants', nargs='*', default=None,
-                    help='Variants to include in the ablation table.')
-    ap.add_argument('--out_ablation_latex', default=None)
     ap.add_argument('--nfe_grid', type=int, nargs='+', default=[1, 2, 4, 8])
     args = ap.parse_args()
 
@@ -424,33 +439,20 @@ if __name__ == '__main__':
     for path in args.json_paths:
         r = load_results(path)
         per_dataset[r['dataset']] = r
-        summary_table_text(r, variant=args.variant, nfe_grid=args.nfe_grid,
-                           metric=args.metric)
-        compute_metrics_text(r, nfe_grid=args.nfe_grid, variant=args.variant)
+        summary_table_text(r, nfe_grid=args.nfe_grid, metric=args.metric)
+        compute_metrics_text(r, nfe_grid=args.nfe_grid)
+        gen_gap_analysis_text(r, nfe_grid=args.nfe_grid, metric=args.metric)
+
+    from pathlib import Path
 
     if args.out_latex:
+        Path(args.out_latex).parent.mkdir(parents=True, exist_ok=True)
         with open(args.out_latex, 'w') as f:
-            f.write(latex_main_table(per_dataset, variant=args.variant))
+            f.write(latex_main_table(per_dataset))
         print(f'\nMain results LaTeX table -> {args.out_latex}')
 
     if args.out_compute_latex:
+        Path(args.out_compute_latex).parent.mkdir(parents=True, exist_ok=True)
         with open(args.out_compute_latex, 'w') as f:
-            f.write(latex_compute_table(per_dataset, variant=args.variant,
-                                        nfe_grid=tuple(args.nfe_grid)))
+            f.write(latex_compute_table(per_dataset, nfe_grid=tuple(args.nfe_grid)))
         print(f'Compute LaTeX table -> {args.out_compute_latex}')
-
-    if args.ablation_baseline and args.ablation_variants:
-        # Use the first JSON's results as the ablation source (one dataset per ablation
-        # is the standard convention).
-        first = list(per_dataset.values())[0]
-        tex = ablation_pairwise_table(first,
-                                      variants=args.ablation_variants,
-                                      baseline_variant=args.ablation_baseline,
-                                      nfe=args.nfe_grid[0],
-                                      metrics=('HR@10', 'NDCG@10'))
-        if args.out_ablation_latex:
-            with open(args.out_ablation_latex, 'w') as f:
-                f.write(tex)
-            print(f'Ablation LaTeX table -> {args.out_ablation_latex}')
-        else:
-            print('\n' + tex)

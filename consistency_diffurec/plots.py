@@ -3,19 +3,15 @@ Plotting utilities for the dissertation.
 
 Black + yellow palette on a white background; serif fonts; consistent style
 across figures. All functions take JSON results from `multi_seed_runner.py`
-(new multi-variant layout) and write PDFs/PNGs to disk.
+and write PDFs/PNGs to disk.
 
-The new JSON layout supports multiple variants:
-    results['variants'][variant_name][seed][nfe][metric]
-    results['latency']['student'][variant_name][nfe]
+Run as a script to generate the standard figure pack:
 
-Most plots in this file pick one "headline" variant (default: 'full_racd')
-and treat the rest as comparisons (e.g. ablation in `plot_ablation_bars`).
+    python plots.py --json_paths results/beauty.json results/toys.json results/ml1m.json \
+                    --out_dir figures/
 
-Run as a script for the standard figure pack:
-
-    python plots.py --json_paths results/beauty.json results/toys.json \
-                    --out_dir figures/ --headline full_racd
+Or import and call individual functions for figures that need extra data
+(e.g. sensitivity sweeps, ablation runs).
 """
 import argparse
 import json
@@ -24,12 +20,13 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 # ---------- Style ----------
 COLORS = {
-    'student':    '#1a1a1a',  # black: distilled student / RACD
+    'student':    '#1a1a1a',  # black: our distilled student
     'teacher':    '#DAA520',  # goldenrod: teacher (full or truncated)
-    'baseline':   '#8B4513',  # saddle brown: alternative baselines (incl. Vanilla CD)
+    'baseline':   '#8B4513',  # saddle brown: alternative baselines
     'tertiary':   '#B8860B',  # dark goldenrod: third series
     'grid':       '#888888',
     'fill_light': '#F4E4A1',  # light yellow for CI fills
@@ -68,49 +65,29 @@ def _save(fig, out_path):
     plt.close(fig)
 
 
-# --------------------------------------------------------------------- #
-#  Variant-aware accessors                                              #
-# --------------------------------------------------------------------- #
-def _seeds_dict(results, variant):
-    """Return seed -> {nfe -> {metric -> float}} for a variant."""
-    if 'variants' in results:
-        return results['variants'][variant]
-    # legacy single-variant layout
-    return results['students']
+def _gather(results, nfe, metric):
+    return np.array([
+        results['students'][seed][str(nfe)][metric]
+        for seed in results['students']
+    ])
 
 
-def _gather(results, variant, nfe, metric):
-    sd = _seeds_dict(results, variant)
-    return np.array([sd[seed][str(nfe)][metric] for seed in sd])
-
-
-def _mean_std(results, variant, nfe_grid, metric):
+def _student_mean_std(results, nfe_grid, metric):
     means, stds = [], []
     for nfe in nfe_grid:
-        vals = _gather(results, variant, nfe, metric)
+        vals = _gather(results, nfe, metric)
         means.append(vals.mean())
         stds.append(vals.std(ddof=1) if len(vals) > 1 else 0.0)
     return np.array(means), np.array(stds)
 
 
-def _student_latency(results, variant):
-    """Return {nfe_str -> ms}."""
-    lat = results['latency']['student']
-    if variant in lat:
-        return lat[variant]
-    return lat  # legacy flat
-
-
-# --------------------------------------------------------------------- #
-#  Figure 1: NFE vs quality (main RQ figure)                            #
-# --------------------------------------------------------------------- #
-def plot_tradeoff_nfe_quality(results_per_dataset, headline='full_racd',
-                              compare='vanilla_cd', metric='HR@10',
+# ---------- Figure 1: trade-off (NFE vs quality) — main RQ2 figure ----------
+def plot_tradeoff_nfe_quality(results_per_dataset, metric='HR@10',
                               out_path='figures/tradeoff_nfe_quality.pdf'):
     """
     Multi-panel: one subplot per dataset.
-    Lines: headline variant (e.g. RACD), compare variant (Vanilla CD),
-    truncated DDIM. Horizontal dashed line: teacher full NFE.
+    Lines: distilled student vs teacher with truncated DDIM.
+    Horizontal dashed line: teacher at full NFE.
     """
     apply_style()
     n = len(results_per_dataset)
@@ -130,32 +107,20 @@ def plot_tradeoff_nfe_quality(results_per_dataset, headline='full_racd',
         truncated = [res['baseline'][str(n_)][metric] for n_ in nfe_grid]
         ax.plot(nfe_grid, truncated,
                 marker=MARKERS['baseline'], color=COLORS['baseline'],
-                linewidth=1.8, linestyle='--', label='Truncated DDIM')
+                linewidth=2.0, label='Truncated DDIM')
 
-        # Compare variant (Vanilla CD)
-        if compare and compare in res.get('variants', {}):
-            cmp_grid = sorted(int(k) for k in
-                              next(iter(_seeds_dict(res, compare).values())).keys())
-            cmp_means, cmp_stds = _mean_std(res, compare, cmp_grid, metric)
-            ax.errorbar(cmp_grid, cmp_means, yerr=cmp_stds,
-                        marker=MARKERS['tertiary'], color=COLORS['tertiary'],
-                        linewidth=1.8, capsize=3, label=compare.replace('_', ' '))
-
-        # Headline variant (RACD)
-        if headline in res.get('variants', {}):
-            head_grid = sorted(int(k) for k in
-                               next(iter(_seeds_dict(res, headline).values())).keys())
-            means, stds = _mean_std(res, headline, head_grid, metric)
-            ax.errorbar(head_grid, means, yerr=stds,
-                        marker=MARKERS['student'], color=COLORS['student'],
-                        linewidth=2.2, capsize=4, label=headline.replace('_', ' '))
-            ax.fill_between(head_grid, means - stds, means + stds,
-                            color=COLORS['fill_light'], alpha=0.4)
+        # Student with error bars
+        means, stds = _student_mean_std(res, nfe_grid, metric)
+        ax.errorbar(nfe_grid, means, yerr=stds,
+                    marker=MARKERS['student'], color=COLORS['student'],
+                    linewidth=2.0, capsize=4, label='Distilled student')
+        ax.fill_between(nfe_grid, means - stds, means + stds,
+                        color=COLORS['fill_light'], alpha=0.4)
 
         ax.set_xscale('log', base=2)
         ax.set_xticks(nfe_grid)
         ax.set_xticklabels(nfe_grid)
-        ax.set_xlabel('NFE')
+        ax.set_xlabel('NFE (number of forward passes)')
         ax.set_ylabel(metric)
         ax.set_title(ds_name)
         ax.legend(loc='lower right', framealpha=0.95)
@@ -164,43 +129,29 @@ def plot_tradeoff_nfe_quality(results_per_dataset, headline='full_racd',
     _save(fig, out_path)
 
 
-# --------------------------------------------------------------------- #
-#  Figure 2: Pareto frontier (latency vs quality)                       #
-# --------------------------------------------------------------------- #
-def plot_pareto(results, headline='full_racd', compare='vanilla_cd',
-                metric='HR@10', out_path='figures/pareto.pdf'):
+# ---------- Figure 2: Pareto frontier (latency vs quality) ----------
+def plot_pareto(results, metric='HR@10', out_path='figures/pareto.pdf'):
     apply_style()
     fig, ax = plt.subplots(figsize=(6, 4.5))
 
-    head_lat = _student_latency(results, headline)
-    nfe_grid = sorted(int(k) for k in head_lat.keys())
+    nfe_grid = sorted(int(k) for k in results['latency']['student'].keys())
 
-    # Headline
-    s_means, s_stds = _mean_std(results, headline, nfe_grid, metric)
-    s_lat = [head_lat[str(n_)] for n_ in nfe_grid]
+    # Student
+    s_means, s_stds = _student_mean_std(results, nfe_grid, metric)
+    s_lat = [results['latency']['student'][str(n_)] for n_ in nfe_grid]
     ax.errorbar(s_lat, s_means, yerr=s_stds,
                 marker=MARKERS['student'], color=COLORS['student'],
-                linewidth=2.2, capsize=4, label=headline.replace('_', ' '))
+                linewidth=2.0, capsize=4, label='Distilled student')
     for nfe, x_, y_ in zip(nfe_grid, s_lat, s_means):
         ax.annotate(f'NFE={nfe}', (x_, y_), textcoords='offset points',
                     xytext=(6, 6), fontsize=9, color=COLORS['student'])
-
-    # Compare variant
-    if compare and compare in results.get('variants', {}):
-        c_lat = _student_latency(results, compare)
-        c_grid = sorted(int(k) for k in c_lat.keys())
-        c_means, _ = _mean_std(results, compare, c_grid, metric)
-        c_lat_vals = [c_lat[str(n_)] for n_ in c_grid]
-        ax.plot(c_lat_vals, c_means,
-                marker=MARKERS['tertiary'], color=COLORS['tertiary'],
-                linewidth=1.8, linestyle='--', label=compare.replace('_', ' '))
 
     # Truncated DDIM
     b_q = [results['baseline'][str(n_)][metric] for n_ in nfe_grid]
     b_lat = [results['latency']['teacher_truncated'][str(n_)] for n_ in nfe_grid]
     ax.plot(b_lat, b_q,
             marker=MARKERS['baseline'], color=COLORS['baseline'],
-            linewidth=1.8, label='Truncated DDIM')
+            linewidth=2.0, label='Truncated DDIM')
 
     # Teacher full
     ax.scatter([results['latency']['teacher_full']],
@@ -217,23 +168,19 @@ def plot_pareto(results, headline='full_racd', compare='vanilla_cd',
     _save(fig, out_path)
 
 
-# --------------------------------------------------------------------- #
-#  Figure 3: latency bars                                               #
-# --------------------------------------------------------------------- #
-def plot_latency_bars(results, headline='full_racd', out_path='figures/latency_bars.pdf'):
+# ---------- Figure 3: latency bar chart ----------
+def plot_latency_bars(results, out_path='figures/latency_bars.pdf'):
     apply_style()
     fig, ax = plt.subplots(figsize=(7, 4))
-    head_lat = _student_latency(results, headline)
-    nfe_grid = sorted(int(k) for k in head_lat.keys())
+    nfe_grid = sorted(int(k) for k in results['latency']['student'].keys())
     x = np.arange(len(nfe_grid))
     w = 0.4
 
-    s_lat = [head_lat[str(n_)] for n_ in nfe_grid]
+    s_lat = [results['latency']['student'][str(n_)] for n_ in nfe_grid]
     t_lat = [results['latency']['teacher_truncated'][str(n_)] for n_ in nfe_grid]
 
     ax.bar(x - w/2, t_lat, w, color=COLORS['baseline'], label='Truncated DDIM')
-    ax.bar(x + w/2, s_lat, w, color=COLORS['student'],
-           label=headline.replace('_', ' '))
+    ax.bar(x + w/2, s_lat, w, color=COLORS['student'], label='Distilled student')
     ax.axhline(results['latency']['teacher_full'], color=COLORS['teacher'],
                linestyle=':', linewidth=1.8,
                label=f"Teacher full (NFE={results['teacher']['T']})")
@@ -247,44 +194,39 @@ def plot_latency_bars(results, headline='full_racd', out_path='figures/latency_b
     _save(fig, out_path)
 
 
-# --------------------------------------------------------------------- #
-#  Figure 4: speedup factor across datasets                             #
-# --------------------------------------------------------------------- #
-def plot_speedup(results_per_dataset, headline='full_racd',
-                 out_path='figures/speedup.pdf'):
+# ---------- Figure 4: speedup factor ----------
+def plot_speedup(results_per_dataset, out_path='figures/speedup.pdf'):
     apply_style()
     fig, ax = plt.subplots(figsize=(7, 4))
 
     datasets = list(results_per_dataset.keys())
-    first = next(iter(results_per_dataset.values()))
-    nfe_grid = sorted(int(k) for k in _student_latency(first, headline).keys())
+    nfe_grid = sorted(int(k) for k in next(iter(results_per_dataset.values()))['latency']['student'].keys())
     x = np.arange(len(datasets))
-    w = 0.8 / max(len(nfe_grid[:4]), 1)
+    w = 0.8 / len(nfe_grid)
     cmap = [COLORS['student'], COLORS['tertiary'], COLORS['baseline'], COLORS['teacher']]
 
-    for i, nfe in enumerate(nfe_grid[:4]):
+    for i, nfe in enumerate(nfe_grid[:4]):  # show first 4 NFEs
         speedups = []
         for ds, res in results_per_dataset.items():
-            lat = _student_latency(res, headline)
-            speedups.append(res['latency']['teacher_full'] / lat[str(nfe)])
+            speedups.append(res['latency']['teacher_full'] /
+                            res['latency']['student'][str(nfe)])
         ax.bar(x + (i - len(nfe_grid[:4])/2 + 0.5) * w, speedups, w,
                label=f'NFE={nfe}', color=cmap[i % len(cmap)])
 
     ax.set_xticks(x)
     ax.set_xticklabels(datasets)
     ax.set_ylabel(r'Speedup vs teacher full ($\times$)')
-    ax.set_title(f'Inference speedup ({headline.replace("_", " ")})')
+    ax.set_title('Inference speedup of distilled student')
     ax.legend()
     _save(fig, out_path)
 
 
-# --------------------------------------------------------------------- #
-#  Figure 5: hyperparameter sensitivity (1 seed per point typical)      #
-# --------------------------------------------------------------------- #
+# ---------- Figure 5: sensitivity to a hyperparameter ----------
 def plot_sensitivity(param_name, param_values, results_per_value,
-                     headline='full_racd', metric='HR@10', out_path=None):
+                     metric='HR@10', out_path=None):
     """
-    `results_per_value`: dict {param_value: results_json}.
+    `results_per_value`: dict {param_value: results_json} — one full multi-seed
+    run per hyperparameter value, all on the same dataset.
     """
     apply_style()
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -292,10 +234,12 @@ def plot_sensitivity(param_name, param_values, results_per_value,
     means, stds = [], []
     for v in param_values:
         res = results_per_value[v]
-        vals = _gather(res, headline, 1, metric)
+        # use NFE=1 (the most challenging single-step regime)
+        vals = _gather(res, 1, metric)
         means.append(vals.mean())
         stds.append(vals.std(ddof=1) if len(vals) > 1 else 0.0)
-    means = np.array(means); stds = np.array(stds)
+    means = np.array(means)
+    stds = np.array(stds)
 
     ax.errorbar(param_values, means, yerr=stds,
                 marker=MARKERS['student'], color=COLORS['student'],
@@ -311,145 +255,33 @@ def plot_sensitivity(param_name, param_values, results_per_value,
     _save(fig, out_path)
 
 
-# --------------------------------------------------------------------- #
-#  Figure 6: main results bar chart                                     #
-# --------------------------------------------------------------------- #
-def plot_main_results_errorbars(results_per_dataset, headline='full_racd',
-                                compare='vanilla_cd', metric='HR@10',
-                                out_path='figures/main_results_errorbars.pdf'):
-    apply_style()
-    datasets = list(results_per_dataset.keys())
-    n = len(datasets)
-    fig, ax = plt.subplots(figsize=(max(6, 2.8 * n), 4.5))
-
-    x = np.arange(n)
-    w = 0.22
-
-    teacher_vals  = [r['teacher']['full_nfe'][metric] for r in results_per_dataset.values()]
-    baseline_vals = [r['baseline']['1'][metric] for r in results_per_dataset.values()]
-    cmp_means, cmp_stds = [], []
-    head_means, head_stds = [], []
-    for r in results_per_dataset.values():
-        if compare in r.get('variants', {}):
-            v = _gather(r, compare, 1, metric)
-            cmp_means.append(v.mean()); cmp_stds.append(v.std(ddof=1) if len(v) > 1 else 0.0)
-        else:
-            cmp_means.append(np.nan); cmp_stds.append(0.0)
-        v = _gather(r, headline, 1, metric)
-        head_means.append(v.mean()); head_stds.append(v.std(ddof=1) if len(v) > 1 else 0.0)
-
-    ax.bar(x - 1.5*w, teacher_vals, w,  color=COLORS['teacher'],
-           label=f'Teacher (NFE=T)', edgecolor='black', linewidth=0.5)
-    ax.bar(x - 0.5*w, baseline_vals, w, color=COLORS['baseline'],
-           label='Truncated DDIM (NFE=1)', edgecolor='black', linewidth=0.5)
-    ax.bar(x + 0.5*w, cmp_means, w, yerr=cmp_stds, capsize=4,
-           color=COLORS['tertiary'], label=f'{compare.replace("_", " ")} (NFE=1)',
-           edgecolor='black', linewidth=0.5,
-           error_kw={'ecolor': 'black', 'elinewidth': 0.8})
-    ax.bar(x + 1.5*w, head_means, w, yerr=head_stds, capsize=4,
-           color=COLORS['student'], label=f'{headline.replace("_", " ")} (NFE=1)',
-           edgecolor='black', linewidth=0.5,
-           error_kw={'ecolor': COLORS['tertiary'], 'elinewidth': 1.5})
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(datasets)
-    ax.set_ylabel(metric)
-    ax.set_title(f'Main results ({metric}, mean $\\pm$ std across seeds)')
-    ax.legend(loc='best')
-    _save(fig, out_path)
-
-
-# --------------------------------------------------------------------- #
-#  Figure 7: bootstrap CI                                               #
-# --------------------------------------------------------------------- #
-def plot_bootstrap_ci(results, headline='full_racd', metric='HR@10',
-                      n_boot=10000, out_path='figures/bootstrap_ci.pdf'):
-    apply_style()
-    nfe_grid = sorted(int(k) for k in results['baseline'].keys())
-
-    means, los, his, base_vals = [], [], [], []
-    rng = np.random.default_rng(0)
-    for nfe in nfe_grid:
-        v = _gather(results, headline, nfe, metric)
-        means.append(v.mean())
-        if len(v) > 1:
-            boots = np.array([rng.choice(v, size=len(v), replace=True).mean()
-                              for _ in range(n_boot)])
-            los.append(np.percentile(boots, 2.5))
-            his.append(np.percentile(boots, 97.5))
-        else:
-            los.append(v.mean()); his.append(v.mean())
-        base_vals.append(results['baseline'][str(nfe)][metric])
-
-    means = np.array(means); los = np.array(los); his = np.array(his)
-
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(nfe_grid, means, marker=MARKERS['student'], color=COLORS['student'],
-            linewidth=2.0, label=f'{headline.replace("_", " ")} (mean)')
-    ax.fill_between(nfe_grid, los, his, color=COLORS['fill_light'], alpha=0.6,
-                    label='95% bootstrap CI')
-    ax.plot(nfe_grid, base_vals, marker=MARKERS['baseline'], color=COLORS['baseline'],
-            linewidth=2.0, linestyle='--', label='Truncated DDIM')
-    ax.axhline(results['teacher']['full_nfe'][metric], color=COLORS['teacher'],
-               linestyle=':', linewidth=1.8,
-               label=f"Teacher full (NFE={results['teacher']['T']})")
-
-    ax.set_xscale('log', base=2)
-    ax.set_xticks(nfe_grid)
-    ax.set_xticklabels(nfe_grid)
-    ax.set_xlabel('NFE')
-    ax.set_ylabel(metric)
-    ax.set_title(f'95% bootstrap CI — {results["dataset"]}')
-    ax.legend()
-    _save(fig, out_path)
-
-
-# --------------------------------------------------------------------- #
-#  Figure 8: ablation bars (Block 1 / Block 2)                          #
-# --------------------------------------------------------------------- #
-def plot_ablation_bars(results, variants, baseline_variant, metric='HR@10',
-                       nfe=1, title=None, out_path='figures/ablation.pdf'):
-    """
-    Bar chart for an ablation block: each bar is one variant, error bars are
-    std over seeds. The baseline_variant is highlighted in a contrasting
-    colour to make the reference obvious.
-    """
-    apply_style()
-    fig, ax = plt.subplots(figsize=(7, 4))
-
-    means, stds = [], []
-    for v in variants:
-        vals = _gather(results, v, nfe, metric)
-        means.append(vals.mean())
-        stds.append(vals.std(ddof=1) if len(vals) > 1 else 0.0)
-
-    x = np.arange(len(variants))
-    colors = [COLORS['baseline'] if v == baseline_variant else COLORS['student']
-              for v in variants]
-    ax.bar(x, means, yerr=stds, color=colors, capsize=4,
-           edgecolor='black', linewidth=0.5)
-    ax.set_xticks(x)
-    ax.set_xticklabels([v.replace('_', ' ') for v in variants],
-                       rotation=20, ha='right')
-    ax.set_ylabel(f'{metric} (NFE={nfe})')
-    if title:
-        ax.set_title(title)
-    else:
-        ax.set_title(f'Ablation (NFE={nfe}, baseline = {baseline_variant})')
-    _save(fig, out_path)
-
-
-# --------------------------------------------------------------------- #
-#  Convergence + val curves (per-seed CSVs from logs)                   #
-# --------------------------------------------------------------------- #
+# ---------- Figure 6: convergence curves ----------
 def plot_convergence(log_dir, out_path='figures/convergence.pdf', skip_warmup=0):
-    import csv, glob
+    """
+    Plot training loss curves for the student, aggregated across seeds.
+
+    Reads all `seed_*.csv` files in `log_dir`, computes mean ± std across
+    seeds for each epoch, and plots a band.
+
+    Parameters
+    ----------
+    log_dir : str
+        Path like `logs/amazon_beauty/` containing per-seed CSV files
+        (`seed_1997.csv`, `seed_42.csv`, ...).
+    skip_warmup : int
+        Skip the first N epochs (loss can be huge at epoch 0 and squashes
+        the y-axis).
+    """
+    import csv
+    import glob
+
     csv_paths = sorted(glob.glob(os.path.join(log_dir, 'seed_*.csv')))
     csv_paths = [p for p in csv_paths if not p.endswith('.val.csv')]
     if not csv_paths:
         print(f'[plot_convergence] no CSVs found in {log_dir}; skip')
         return
 
+    # Collect per-seed series
     series = []
     for p in csv_paths:
         ep, cons, ce, total = [], [], [], []
@@ -461,6 +293,7 @@ def plot_convergence(log_dir, out_path='figures/convergence.pdf', skip_warmup=0)
                 total.append(float(row['total_loss']))
         series.append((np.array(ep), np.array(cons), np.array(ce), np.array(total)))
 
+    # Pad to common length (early stopping makes seeds finish at different epochs)
     max_len = max(len(s[0]) for s in series)
     def _stack(idx):
         rows = []
@@ -472,11 +305,15 @@ def plot_convergence(log_dir, out_path='figures/convergence.pdf', skip_warmup=0)
         return np.vstack(rows)
 
     epochs = np.arange(max_len)
-    cons_mat  = _stack(1); ce_mat = _stack(2); total_mat = _stack(3)
+    cons_mat  = _stack(1)
+    ce_mat    = _stack(2)
+    total_mat = _stack(3)
+
     sl = slice(skip_warmup, None)
 
     apply_style()
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
     for ax, mat, title, color in [
         (axes[0], cons_mat,  'Consistency loss',     COLORS['student']),
         (axes[1], ce_mat,    'Cross-entropy loss',   COLORS['baseline']),
@@ -488,18 +325,29 @@ def plot_convergence(log_dir, out_path='figures/convergence.pdf', skip_warmup=0)
         ax.plot(e, m, color=color, linewidth=2.0, label='mean across seeds')
         ax.fill_between(e, m - s, m + s, color=COLORS['fill_light'], alpha=0.5,
                         label=r'$\pm$ 1 std')
-        ax.set_xlabel('Epoch'); ax.set_ylabel(title); ax.set_title(title)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(title)
+        ax.set_title(title)
         ax.legend(loc='upper right', fontsize=9)
+
     fig.suptitle(f'Student training convergence ({len(series)} seeds)', y=1.02)
     _save(fig, out_path)
 
 
 def plot_val_curves(log_dir, metric='HR@10', out_path='figures/val_curve.pdf'):
-    import csv, glob
+    """
+    Validation HR/NDCG over training epochs, aggregated across seeds.
+    Reads `seed_*.csv.val.csv` files. Useful for showing convergence of the
+    student's recsys quality (not just the loss).
+    """
+    import csv
+    import glob
+
     csv_paths = sorted(glob.glob(os.path.join(log_dir, 'seed_*.csv.val.csv')))
     if not csv_paths:
         print(f'[plot_val_curves] no val CSVs in {log_dir}; skip')
         return
+
     series = []
     for p in csv_paths:
         ep, val = [], []
@@ -527,23 +375,214 @@ def plot_val_curves(log_dir, metric='HR@10', out_path='figures/val_curve.pdf'):
     ax.fill_between(epochs[:len(m)], m - s, m + s,
                     color=COLORS['fill_light'], alpha=0.5,
                     label=r'$\pm$ 1 std')
-    ax.set_xlabel('Epoch'); ax.set_ylabel(f'Val {metric} (NFE=1)')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel(f'Val {metric} (NFE=1)')
     ax.set_title(f'Validation {metric} over training ({len(series)} seeds)')
     ax.legend()
     _save(fig, out_path)
 
 
-# --------------------------------------------------------------------- #
-#  Main                                                                 #
-# --------------------------------------------------------------------- #
+# ---------- Figure: main results bar chart with error bars ----------
+def plot_main_results_errorbars(results_per_dataset, metric='HR@10',
+                                out_path='figures/main_results_errorbars.pdf'):
+    """
+    Bar chart per dataset: teacher full / truncated DDIM at NFE=1 / student at NFE=1,
+    with std error bars across seeds for the student.
+    """
+    apply_style()
+    datasets = list(results_per_dataset.keys())
+    n = len(datasets)
+    fig, ax = plt.subplots(figsize=(max(6, 2.5 * n), 4.5))
+
+    x = np.arange(n)
+    w = 0.27
+
+    teacher_vals  = [r['teacher']['full_nfe'][metric] for r in results_per_dataset.values()]
+    baseline_vals = [r['baseline']['1'][metric] for r in results_per_dataset.values()]
+    student_means, student_stds = [], []
+    for r in results_per_dataset.values():
+        v = _gather(r, 1, metric)
+        student_means.append(v.mean())
+        student_stds.append(v.std(ddof=1) if len(v) > 1 else 0.0)
+
+    ax.bar(x - w, teacher_vals, w,  color=COLORS['teacher'],  label='Teacher (NFE=T)',
+           edgecolor='black', linewidth=0.5)
+    ax.bar(x,     baseline_vals, w, color=COLORS['baseline'], label='Truncated DDIM (NFE=1)',
+           edgecolor='black', linewidth=0.5)
+    ax.bar(x + w, student_means, w, yerr=student_stds, capsize=5,
+           color=COLORS['student'], label='Distilled student (NFE=1)',
+           edgecolor='black', linewidth=0.5,
+           error_kw={'ecolor': COLORS['tertiary'], 'elinewidth': 1.5})
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(datasets)
+    ax.set_ylabel(metric)
+    ax.set_title(f'Main results ({metric}, mean $\\pm$ std across seeds)')
+    ax.legend(loc='best')
+    _save(fig, out_path)
+
+
+# ---------- Figure: bootstrap confidence intervals ----------
+def plot_bootstrap_ci(results, metric='HR@10', n_boot=10000,
+                      out_path='figures/bootstrap_ci.pdf'):
+    """
+    For each NFE in the student's grid, draw a bootstrap 95% CI.
+    Visually answers: is the student's improvement over truncated-DDIM
+    at each NFE statistically meaningful?
+    """
+    apply_style()
+    nfe_grid = sorted(int(k) for k in results['baseline'].keys())
+
+    means, los, his = [], [], []
+    base_vals = []
+    rng = np.random.default_rng(0)
+    for nfe in nfe_grid:
+        v = _gather(results, nfe, metric)
+        means.append(v.mean())
+        if len(v) > 1:
+            boots = np.array([rng.choice(v, size=len(v), replace=True).mean()
+                              for _ in range(n_boot)])
+            los.append(np.percentile(boots, 2.5))
+            his.append(np.percentile(boots, 97.5))
+        else:
+            los.append(v.mean()); his.append(v.mean())
+        base_vals.append(results['baseline'][str(nfe)][metric])
+
+    means = np.array(means); los = np.array(los); his = np.array(his)
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(nfe_grid, means, marker=MARKERS['student'], color=COLORS['student'],
+            linewidth=2.0, label='Student (mean)')
+    ax.fill_between(nfe_grid, los, his, color=COLORS['fill_light'], alpha=0.6,
+                    label='Student 95% bootstrap CI')
+    ax.plot(nfe_grid, base_vals, marker=MARKERS['baseline'], color=COLORS['baseline'],
+            linewidth=2.0, linestyle='--', label='Truncated DDIM')
+    ax.axhline(results['teacher']['full_nfe'][metric], color=COLORS['teacher'],
+               linestyle=':', linewidth=1.8,
+               label=f"Teacher full (NFE={results['teacher']['T']})")
+
+    ax.set_xscale('log', base=2)
+    ax.set_xticks(nfe_grid)
+    ax.set_xticklabels(nfe_grid)
+    ax.set_xlabel('NFE')
+    ax.set_ylabel(metric)
+    ax.set_title(f'95% bootstrap CI — {results["dataset"]}')
+    ax.legend()
+    _save(fig, out_path)
+
+
+# ---------- Figure: val vs test generalization gap ----------
+def plot_val_vs_test_gap(results, metric='HR@10', nfe_grid=(1, 2, 4, 8, 16, 32),
+                         out_path='figures/val_test_gap.pdf'):
+    """
+    Side-by-side bars comparing val and test metric for the student at each
+    NFE, plus reference lines for teacher val and teacher test.
+
+    The point of this figure is to show that the student's generalization
+    gap (val - test) tracks the teacher's gap, i.e. distillation does not
+    introduce additional overfitting.
+    """
+    apply_style()
+
+    val_means, val_stds, test_means, test_stds = [], [], [], []
+    for nfe in nfe_grid:
+        # Test arrays
+        test_v = np.array([
+            results['students'][s][str(nfe)][metric]
+            for s in results['students']
+        ])
+        # Val arrays — may not exist on older JSONs
+        seeds = list(results['students'].keys())
+        if '_val' not in results['students'][seeds[0]]:
+            print(f'[plot_val_vs_test_gap] no val metrics in JSON for '
+                  f'{results["dataset"]}, skipping.')
+            return
+        val_v = np.array([
+            results['students'][s]['_val'][str(nfe)][metric]
+            for s in seeds
+        ])
+        val_means.append(val_v.mean())
+        val_stds.append(val_v.std(ddof=1) if len(val_v) > 1 else 0.0)
+        test_means.append(test_v.mean())
+        test_stds.append(test_v.std(ddof=1) if len(test_v) > 1 else 0.0)
+
+    val_means  = np.array(val_means)
+    val_stds   = np.array(val_stds)
+    test_means = np.array(test_means)
+    test_stds  = np.array(test_stds)
+
+    x = np.arange(len(nfe_grid))
+    w = 0.38
+
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    ax.bar(x - w / 2, val_means, w, yerr=val_stds, capsize=3,
+           color=COLORS['student'], alpha=0.85,
+           edgecolor='black', linewidth=0.5,
+           label='Student — Validation')
+    ax.bar(x + w / 2, test_means, w, yerr=test_stds, capsize=3,
+           color=COLORS['fill_light'], alpha=0.95,
+           edgecolor='black', linewidth=0.5,
+           label='Student — Test')
+
+    # Teacher reference lines
+    teacher_test = results['teacher']['full_nfe'].get(metric)
+    teacher_val  = results['teacher'].get('full_nfe_val', {}).get(metric)
+    if teacher_test is not None:
+        ax.axhline(teacher_test, color=COLORS['teacher'],
+                   linestyle=':', linewidth=1.8,
+                   label=f'Teacher — Test ({teacher_test:.2f})')
+    if teacher_val is not None:
+        ax.axhline(teacher_val, color=COLORS['baseline'],
+                   linestyle='--', linewidth=1.5, alpha=0.8,
+                   label=f'Teacher — Validation ({teacher_val:.2f})')
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(n) for n in nfe_grid])
+    ax.set_xlabel('NFE')
+    ax.set_ylabel(metric)
+    ax.set_title(f'Validation vs test {metric} — {results["dataset"]}\n'
+                 f'(generalization gap check)', fontsize=11)
+    ax.legend(loc='best', fontsize=9)
+    _save(fig, out_path)
+
+
+# ---------- Figure 7: ablation bar chart ----------
+def plot_ablation(ablation_results, metric='HR@10', out_path='figures/ablation.pdf'):
+    """
+    `ablation_results`: dict {variant_name: results_json}.
+    Plots NFE=1 metric for each variant with error bars.
+    """
+    apply_style()
+    fig, ax = plt.subplots(figsize=(7, 4))
+
+    names = list(ablation_results.keys())
+    means, stds = [], []
+    for name in names:
+        vals = _gather(ablation_results[name], 1, metric)
+        means.append(vals.mean())
+        stds.append(vals.std(ddof=1) if len(vals) > 1 else 0.0)
+
+    x = np.arange(len(names))
+    colors = [COLORS['student'] if n.startswith('Full') else COLORS['baseline']
+              for n in names]
+    ax.bar(x, means, yerr=stds, color=colors, capsize=4,
+           edgecolor='black', linewidth=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=20, ha='right')
+    ax.set_ylabel(metric)
+    ax.set_title('Ablation study (NFE = 1)')
+    _save(fig, out_path)
+
+
+# ---------- Standalone runner ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--json_paths', nargs='+', required=True)
     ap.add_argument('--out_dir', default='figures')
     ap.add_argument('--metric', default='HR@10')
-    ap.add_argument('--headline', default='full_racd')
-    ap.add_argument('--compare', default='vanilla_cd')
-    ap.add_argument('--logs_root', default='logs')
+    ap.add_argument('--logs_root', default='logs',
+                    help='Root dir of per-dataset, per-seed CSV logs '
+                         '(default: logs/, written by multi_seed_runner.py).')
     args = ap.parse_args()
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
@@ -553,34 +592,32 @@ def main():
             r = json.load(f)
         per_dataset[r['dataset']] = r
 
-    plot_tradeoff_nfe_quality(per_dataset, headline=args.headline,
-                              compare=args.compare, metric=args.metric,
+    plot_tradeoff_nfe_quality(per_dataset, metric=args.metric,
                               out_path=os.path.join(args.out_dir, 'tradeoff_HR10.pdf'))
-    plot_tradeoff_nfe_quality(per_dataset, headline=args.headline,
-                              compare=args.compare, metric='NDCG@10',
+    plot_tradeoff_nfe_quality(per_dataset, metric='NDCG@10',
                               out_path=os.path.join(args.out_dir, 'tradeoff_NDCG10.pdf'))
-    plot_speedup(per_dataset, headline=args.headline,
-                 out_path=os.path.join(args.out_dir, 'speedup.pdf'))
-    plot_main_results_errorbars(per_dataset, headline=args.headline,
-                                compare=args.compare, metric=args.metric,
+    plot_speedup(per_dataset, out_path=os.path.join(args.out_dir, 'speedup.pdf'))
+    plot_main_results_errorbars(per_dataset, metric=args.metric,
                                 out_path=os.path.join(args.out_dir, 'main_results_errorbars.pdf'))
 
     for name, res in per_dataset.items():
         slug = name.replace('/', '_').replace(' ', '_')
-        plot_pareto(res, headline=args.headline, compare=args.compare,
-                    metric=args.metric,
+        plot_pareto(res, metric=args.metric,
                     out_path=os.path.join(args.out_dir, f'pareto_{slug}.pdf'))
-        plot_latency_bars(res, headline=args.headline,
+        plot_latency_bars(res,
                           out_path=os.path.join(args.out_dir, f'latency_{slug}.pdf'))
-        plot_bootstrap_ci(res, headline=args.headline, metric=args.metric,
+        plot_bootstrap_ci(res, metric=args.metric,
                           out_path=os.path.join(args.out_dir, f'bootstrap_ci_{slug}.pdf'))
 
+        # Convergence + val curves require per-seed CSVs from multi_seed_runner.
         log_dir = os.path.join(args.logs_root, name)
         if os.path.isdir(log_dir):
             plot_convergence(log_dir,
                              out_path=os.path.join(args.out_dir, f'convergence_{slug}.pdf'))
             plot_val_curves(log_dir, metric=args.metric,
                             out_path=os.path.join(args.out_dir, f'val_curve_{slug}.pdf'))
+        else:
+            print(f'[main] {log_dir} not found; skipping convergence plots for {name}')
 
     print(f'Figures written to {args.out_dir}/')
 
