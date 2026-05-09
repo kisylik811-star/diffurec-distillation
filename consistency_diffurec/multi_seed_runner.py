@@ -1,45 +1,31 @@
 """
 Multi-seed multi-variant experiment runner for the RACD pipeline.
 
-Trains one teacher (cached on disk), then trains a *grid of student
-variants* with different random seeds, evaluating each at the requested
-NFE values. Also evaluates the teacher with truncated DDIM (the naive
-acceleration baseline) at the same NFEs.
+Layered configuration (later layers override earlier ones):
+  1. argparse defaults
+  2. CLI-supplied values
+  3. VARIANT_CONFIGS for the named variant — but ONLY for keys the user
+     did NOT explicitly pass on the CLI. CLI > variant > defaults.
 
-Variant catalog (see VARIANT_CONFIGS below):
+This means a sensitivity sweep over `--reward_weight 0.01 0.05 0.1` works
+correctly even when the variant is `full_racd` (which would otherwise pin
+reward_weight=1.0). The same applies to ndcg_weight, margin_weight,
+ndcg_alpha, hard_neg_k, margin_value, parametrization, solver, use_ema.
 
-  Block 1 — RACD components.
-    Baseline = vanilla_cd. Compare via paired Wilcoxon vs vanilla_cd.
-      vanilla_cd     reward off
-      ndcg_only      reward = ApproxNDCG
-      margin_only    reward = pairwise hard-neg margin
-      full_racd      reward = ApproxNDCG + margin
-
-  Block 2 — Design choices (justifying configuration of full_racd).
-    Baseline = full_racd. Compare via paired Wilcoxon vs full_racd.
-      full_racd      solver=ddim, parametrization=xstart, use_ema=True
-      with_heun      solver=heun (one knob flipped)
-      with_eps       parametrization=eps (one knob flipped)
-      no_ema         use_ema=False (one knob flipped)
-
-    All Block-2 variants keep the RACD reward on, so they are clean
-    leave-one-out modifications of full_racd.
-
-Usage:
-    PYTHONPATH=../DiffuRec/src python multi_seed_runner.py \\
-        --dataset amazon_beauty \\
-        --teacher_ckpt checkpoints/teacher_amazon_beauty.pt \\
-        --seeds 1997 42 2024 \\
-        --variants vanilla_cd full_racd \\
-        --nfe_grid 1 2 4 8 16 32 \\
-        --out_json results/beauty_main.json
+CSV logging:
+  Per-seed CSV files are written under
+      log_dir / variant / seed_<seed>.csv          (per-epoch losses)
+      log_dir / variant / seed_<seed>.csv.val.csv  (per-eval val metrics)
+  These feed plots.plot_convergence and plots.plot_val_curves.
 """
 import argparse
 import copy
+import csv
 import json
 import os
 import pickle
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -56,26 +42,16 @@ from evaluation import evaluate_teacher_truncated, measure_latency_grid
 
 
 # ---------------------------------------------------------------- #
-#  Variant catalog                                                 #
+#  Variant catalog — see top-of-file comment about override order  #
 # ---------------------------------------------------------------- #
-# Each entry is the set of overrides applied on top of CLI args
-# before constructing the student. Keys not listed here keep their
-# CLI-default value. The full set of student-recognised override
-# keys is:
-#   reward_weight, ndcg_weight, margin_weight, ndcg_alpha,
-#   hard_neg_k, margin_value, parametrization, solver, use_ema
-#
-# Defaults (mirrored from the CLI defaults in parse_args) are:
-#   parametrization = 'xstart',  solver = 'ddim',  use_ema = True
-
 VARIANT_CONFIGS = {
-    # ----- Block 1: RACD components -----
+    # Block 1: RACD components
     'vanilla_cd':  dict(reward_weight=0.0, ndcg_weight=0.0,  margin_weight=0.0),
     'ndcg_only':   dict(reward_weight=1.0, ndcg_weight=0.5,  margin_weight=0.0),
     'margin_only': dict(reward_weight=1.0, ndcg_weight=0.0,  margin_weight=0.5),
     'full_racd':   dict(reward_weight=1.0, ndcg_weight=0.5,  margin_weight=0.5),
 
-    # ----- Block 2: design choices (each flips ONE knob from full_racd) -----
+    # Block 2: design choices (each flips ONE knob from full_racd)
     'with_heun':   dict(reward_weight=1.0, ndcg_weight=0.5, margin_weight=0.5,
                         solver='heun'),
     'with_eps':    dict(reward_weight=1.0, ndcg_weight=0.5, margin_weight=0.5,
@@ -87,7 +63,7 @@ VARIANT_CONFIGS = {
 
 def parse_args():
     p = argparse.ArgumentParser()
-    # ----- DiffuRec args (subset that matters) -----
+    # ----- DiffuRec args -----
     p.add_argument('--dataset', default='amazon_beauty')
     p.add_argument('--data_root', default='../datasets/data')
     p.add_argument('--max_len', type=int, default=50)
@@ -125,7 +101,7 @@ def parse_args():
     p.add_argument('--teacher_ckpt', default=None)
     p.add_argument('--save_teacher_ckpt', default='checkpoints/teacher_{dataset}.pt')
 
-    # ----- Distillation defaults (variants override the relevant fields) -----
+    # ----- Distillation defaults -----
     p.add_argument('--distill_lr', type=float, default=1e-3)
     p.add_argument('--distill_epochs', type=int, default=200)
     p.add_argument('--distill_eval_interval', type=int, default=5)
@@ -134,7 +110,7 @@ def parse_args():
     p.add_argument('--ce_weight', type=float, default=1.0)
     p.add_argument('--ema_decay', type=float, default=0.95)
 
-    # Reward defaults — variants override these.
+    # Reward defaults — variants override these *only when CLI does not*.
     p.add_argument('--reward_weight', type=float, default=0.0)
     p.add_argument('--ndcg_weight', type=float, default=0.0)
     p.add_argument('--margin_weight', type=float, default=0.0)
@@ -142,17 +118,10 @@ def parse_args():
     p.add_argument('--hard_neg_k', type=int, default=16)
     p.add_argument('--margin_value', type=float, default=0.0)
 
-    # Block-2 design-switch defaults — variants override these.
-    p.add_argument('--parametrization', choices=['xstart', 'eps'], default='xstart',
-                   help='Interpretation of the network output: predicted x_0 '
-                        '(xstart, default) or predicted noise (eps).')
-    p.add_argument('--solver', choices=['ddim', 'heun'], default='ddim',
-                   help='Solver for the teacher target step. ddim is 1st-order '
-                        '(default, cheap); heun is 2nd-order (~2x cost per '
-                        'consistency step).')
-    p.add_argument('--use_ema', type=lambda s: str(s).lower() == 'true', default=True,
-                   help='Use EMA target network for the consistency target. '
-                        'Pass False to disable (no_ema variant).')
+    # Block-2 design switches.
+    p.add_argument('--parametrization', choices=['xstart', 'eps'], default='xstart')
+    p.add_argument('--solver', choices=['ddim', 'heun'], default='ddim')
+    p.add_argument('--use_ema', type=lambda s: str(s).lower() == 'true', default=True)
 
     # ----- Multi-seed / multi-variant -----
     p.add_argument('--seeds', type=int, nargs='+', default=[1997, 42, 2024])
@@ -160,12 +129,59 @@ def parse_args():
     p.add_argument('--variants', nargs='+', default=['vanilla_cd', 'full_racd'])
     p.add_argument('--nfe_grid', type=int, nargs='+', default=[1, 2, 4, 8, 16, 32])
     p.add_argument('--out_json', default='results/multiseed.json')
+    p.add_argument('--csv_log_root', default='logs/',
+                   help='Root directory for per-seed CSV training logs.')
 
     args = p.parse_args()
     args.epochs = args.teacher_epochs
     return args
 
 
+# ---------------------------------------------------------------- #
+#  Override-order helpers                                          #
+# ---------------------------------------------------------------- #
+def _explicit_cli_keys(argv=None):
+    """
+    Return the set of CLI flag names (with leading '--' stripped) that the
+    user actually typed, so we can preserve those over VARIANT_CONFIGS.
+
+    Heuristic: anything that starts with '--' and isn't a value. Conservative
+    and good enough for our flag set; we don't have nested groups.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    keys = set()
+    for tok in argv:
+        if tok.startswith('--'):
+            name = tok.lstrip('-').split('=', 1)[0]
+            keys.add(name)
+    return keys
+
+
+def apply_variant_overrides(base_args, variant_name, cli_keys):
+    """
+    Apply VARIANT_CONFIGS[variant_name] on top of `base_args`, but DO NOT
+    override keys that the user passed explicitly on the CLI.
+    """
+    if variant_name not in VARIANT_CONFIGS:
+        raise KeyError(f'Unknown variant: {variant_name}. '
+                       f'Known: {list(VARIANT_CONFIGS.keys())}')
+    cfg = VARIANT_CONFIGS[variant_name]
+    a = copy.copy(base_args)
+    skipped = []
+    for k, v in cfg.items():
+        if k in cli_keys:
+            skipped.append(k)
+            continue
+        setattr(a, k, v)
+    if skipped:
+        print(f'  [variant {variant_name}] CLI overrides keep: {sorted(skipped)}')
+    return a
+
+
+# ---------------------------------------------------------------- #
+#  Misc                                                            #
+# ---------------------------------------------------------------- #
 def fix_seed(s):
     random.seed(s)
     torch.manual_seed(s)
@@ -186,23 +202,11 @@ def load_data(args):
     return tra, val, tst
 
 
-def apply_variant_overrides(base_args, variant_name):
-    if variant_name not in VARIANT_CONFIGS:
-        raise KeyError(f'Unknown variant: {variant_name}. '
-                       f'Known: {list(VARIANT_CONFIGS.keys())}')
-    cfg = VARIANT_CONFIGS[variant_name]
-    a = copy.copy(base_args)
-    for k, v in cfg.items():
-        setattr(a, k, v)
-    return a
-
-
 class _DummyLogger:
     def info(self, *a, **k): pass
 
 
 def _describe_variant(v_args):
-    """Compact one-line description of the active design switches."""
     return (f"reward_weight={getattr(v_args, 'reward_weight', 0)} "
             f"ndcg_weight={getattr(v_args, 'ndcg_weight', 0)} "
             f"margin_weight={getattr(v_args, 'margin_weight', 0)} | "
@@ -211,8 +215,46 @@ def _describe_variant(v_args):
             f"use_ema={getattr(v_args, 'use_ema', True)}")
 
 
+# ---------------------------------------------------------------- #
+#  CSV logger (writes one CSV per (variant, seed))                 #
+# ---------------------------------------------------------------- #
+class CsvEpochLogger:
+    """Append per-epoch loss CSV and per-eval val-metrics CSV."""
+
+    def __init__(self, root, dataset, variant, seed):
+        self.dir = Path(root) / dataset / variant
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.train_path = self.dir / f'seed_{seed}.csv'
+        self.val_path   = self.dir / f'seed_{seed}.csv.val.csv'
+        self._train_init = False
+        self._val_init = False
+
+    def log_epoch(self, epoch, cons, ce, reward, total):
+        first = not self._train_init
+        with open(self.train_path, 'a', newline='') as f:
+            w = csv.writer(f)
+            if first:
+                w.writerow(['epoch', 'cons_loss', 'ce_loss', 'reward_loss', 'total_loss'])
+                self._train_init = True
+            w.writerow([epoch, cons, ce, reward, total])
+
+    def log_val(self, epoch, metrics):
+        first = not self._val_init
+        with open(self.val_path, 'a', newline='') as f:
+            keys = sorted(metrics.keys())
+            w = csv.writer(f)
+            if first:
+                w.writerow(['epoch'] + keys)
+                self._val_init = True
+            w.writerow([epoch] + [metrics[k] for k in keys])
+
+
+# ---------------------------------------------------------------- #
+#  Main                                                            #
+# ---------------------------------------------------------------- #
 def main():
     args = parse_args()
+    cli_keys = _explicit_cli_keys()  # snapshot before any further mutation
     args.save_teacher_ckpt = args.save_teacher_ckpt.format(dataset=args.dataset)
     Path(os.path.dirname(args.out_json) or '.').mkdir(parents=True, exist_ok=True)
     Path(os.path.dirname(args.save_teacher_ckpt) or '.').mkdir(parents=True, exist_ok=True)
@@ -225,6 +267,7 @@ def main():
     print(f'[Data] {args.dataset}: item_num={args.item_num}')
     print(f'[Plan] variants={args.variants}, seeds={args.seeds}, '
           f'NFE grid={args.nfe_grid}')
+    print(f'[CLI keys explicit]: {sorted(cli_keys)}')
 
     results = {
         'dataset':  args.dataset,
@@ -236,7 +279,7 @@ def main():
         'latency':  {'student': {v: {} for v in args.variants}},
     }
 
-    # ---- Teacher (trained once, reused) ----
+    # ---- Teacher ----
     teacher_ckpt = args.teacher_ckpt or args.save_teacher_ckpt
     teacher = Att_Diffuse_model(create_model_diffu(args), args).to(device)
     if os.path.exists(teacher_ckpt):
@@ -256,18 +299,16 @@ def main():
     results['teacher']['full_nfe'] = evaluate_teacher_full_nfe(teacher, test_loader, device)
     results['teacher']['T'] = args.diffusion_steps
 
-    # ---- Truncated DDIM baseline ----
     print('[Baseline] truncated DDIM at varying NFE')
     for nfe in args.nfe_grid:
         m = evaluate_teacher_truncated(teacher, test_loader, num_steps=nfe, device=device)
         results['baseline'][str(nfe)] = m
         print(f'  truncated NFE={nfe}: {m}')
 
-    # ---- Multi-variant x multi-seed students ----
     last_student = None
     for variant_name in args.variants:
         print(f'\n=========== Variant: {variant_name} ===========')
-        v_args = apply_variant_overrides(args, variant_name)
+        v_args = apply_variant_overrides(args, variant_name, cli_keys)
         print('  ' + _describe_variant(v_args))
 
         for seed in args.seeds:
@@ -277,8 +318,12 @@ def main():
 
             student = ConsistencyStudent(teacher, v_args,
                                          ema_decay=v_args.ema_decay).to(device)
+
+            csv_logger = CsvEpochLogger(args.csv_log_root, args.dataset,
+                                        variant_name, seed)
+
             best_student = distill_train(student, teacher, tra_s, val_s, tst_s,
-                                         v_args, logger)
+                                         v_args, logger, csv_logger=csv_logger)
 
             seed_results = {}
             for nfe in args.nfe_grid:

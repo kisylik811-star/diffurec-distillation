@@ -10,7 +10,6 @@ from trainer import hrs_and_ndcgs_k
 
 @torch.no_grad()
 def evaluate_at_nfe(student, loader, num_steps, device, ks=(5, 10, 20)):
-    """Evaluate the student at a given number of forward passes (NFE)."""
     student.eval()
     acc = {f'HR@{k}': [] for k in ks}
     acc.update({f'NDCG@{k}': [] for k in ks})
@@ -25,7 +24,6 @@ def evaluate_at_nfe(student, loader, num_steps, device, ks=(5, 10, 20)):
 
 @torch.no_grad()
 def evaluate_teacher_full_nfe(teacher_model, loader, device, ks=(5, 10, 20)):
-    """Evaluate the teacher with its native iterative reverse loop (NFE = T)."""
     teacher_model.eval()
     acc = {f'HR@{k}': [] for k in ks}
     acc.update({f'NDCG@{k}': [] for k in ks})
@@ -42,7 +40,6 @@ def evaluate_teacher_full_nfe(teacher_model, loader, device, ks=(5, 10, 20)):
 @torch.no_grad()
 def measure_inference_latency(model, sample_batch, device, num_steps=None,
                               n_warmup=10, n_runs=50, mode='student'):
-    """Measure mean inference time per sample (in milliseconds)."""
     seq, target = [x.to(device) for x in sample_batch]
     model.eval()
 
@@ -67,14 +64,11 @@ def measure_inference_latency(model, sample_batch, device, num_steps=None,
 
 
 def distill_train(student, teacher_model, train_loader, val_loader, test_loader,
-                  args, logger):
+                  args, logger, csv_logger=None):
     """
     Train the student via (Reward-Aware) Consistency Distillation against a
-    frozen teacher.
-
-    `teacher_model` is the full Att_Diffuse_model (not just teacher_diffu),
-    because reward mining (margin term) needs teacher.item_embeddings as well
-    as teacher.diffu.
+    frozen teacher. `csv_logger` is optional; if provided, per-epoch losses
+    and per-eval val metrics are appended to disk for later plotting.
     """
     device = torch.device(args.device)
     student = student.to(device)
@@ -112,18 +106,29 @@ def distill_train(student, teacher_model, train_loader, val_loader, test_loader,
             running_rwd  += float(reward_loss.detach())
             n_b += 1
 
+        avg_cons = running_cons / max(n_b, 1)
+        avg_ce   = running_ce   / max(n_b, 1)
+        avg_rwd  = running_rwd  / max(n_b, 1)
+        avg_total = cons_w * avg_cons + ce_w * avg_ce + reward_w * avg_rwd
+
         msg = (f'[Distill][Epoch {epoch}] '
-               f'cons={running_cons / max(n_b, 1):.4f} '
-               f'ce={running_ce / max(n_b, 1):.4f} '
-               f'reward={running_rwd / max(n_b, 1):.4f}')
+               f'cons={avg_cons:.4f} '
+               f'ce={avg_ce:.4f} '
+               f'reward={avg_rwd:.4f}')
         print(msg)
         logger.info(msg)
+
+        if csv_logger is not None:
+            csv_logger.log_epoch(epoch, avg_cons, avg_ce, avg_rwd, avg_total)
 
         if epoch % args.distill_eval_interval == 0:
             val_metrics = evaluate_at_nfe(student, val_loader, num_steps=1, device=device)
             msg = f'[Val NFE=1] {val_metrics}'
             print(msg)
             logger.info(msg)
+
+            if csv_logger is not None:
+                csv_logger.log_val(epoch, val_metrics)
 
             if val_metrics['HR@10'] > best_score:
                 best_score = val_metrics['HR@10']
