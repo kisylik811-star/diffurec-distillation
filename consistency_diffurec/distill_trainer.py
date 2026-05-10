@@ -1,7 +1,7 @@
 """Training loop and evaluation utilities for consistency distillation.
 
-Now also writes per-epoch loss curves and per-eval validation metrics to a
-CSV file, which `plots.py` reads to render convergence figures.
+Updated for RCCD: tracks three loss components (cons, ce, contrast) and
+writes them to the per-epoch CSV log.
 """
 import copy
 import csv
@@ -75,7 +75,7 @@ def measure_inference_latency(model, sample_batch, device, num_steps=None,
 
 
 def _open_csv(path, header):
-    """Create a CSV file at `path`, write the header. Returns file handle and writer."""
+    """Create a CSV file at `path`, write the header. Returns (handle, writer)."""
     Path(os.path.dirname(path) or '.').mkdir(parents=True, exist_ok=True)
     f = open(path, 'w', newline='')
     w = csv.writer(f)
@@ -85,10 +85,10 @@ def _open_csv(path, header):
 
 def distill_train(student, teacher_diffu, train_loader, val_loader, test_loader,
                   args, logger, log_csv_path=None):
-    """Train the student via consistency distillation against a frozen teacher.
+    """Train the student via RCCD against a frozen teacher.
 
-    If `log_csv_path` is provided, two CSV files are produced:
-      - `<log_csv_path>`         -> per-epoch cons/ce/total loss
+    Two CSV files are produced when `log_csv_path` is set:
+      - `<log_csv_path>`         -> per-epoch cons/ce/contrast/total loss
       - `<log_csv_path>.val.csv` -> per-eval val HR/NDCG at NFE=1
     """
     device = torch.device(args.device)
@@ -100,12 +100,16 @@ def distill_train(student, teacher_diffu, train_loader, val_loader, test_loader,
 
     optimizer = optim.Adam(student.parameters(), lr=args.distill_lr)
 
+    # Pull weights with safe defaults so older configs still work.
+    contrast_weight = getattr(args, 'contrast_weight', 0.5)
+    contrast_temperature = getattr(args, 'contrast_temperature', 0.1)
+
     loss_writer = val_writer = None
     loss_f = val_f = None
     if log_csv_path is not None:
         loss_f, loss_writer = _open_csv(
             log_csv_path,
-            ['epoch', 'cons_loss', 'ce_loss', 'total_loss'],
+            ['epoch', 'cons_loss', 'ce_loss', 'contrast_loss', 'total_loss'],
         )
         val_path = log_csv_path + '.val.csv'
         val_f, val_writer = _open_csv(
@@ -120,29 +124,45 @@ def distill_train(student, teacher_diffu, train_loader, val_loader, test_loader,
     try:
         for epoch in range(args.distill_epochs):
             student.train()
-            running_cons, running_ce, n_b = 0.0, 0.0, 0
+            running_cons, running_ce, running_contrast, n_b = 0.0, 0.0, 0.0, 0
             for batch in train_loader:
                 seq, target = [x.to(device) for x in batch]
                 optimizer.zero_grad()
-                cons_loss, ce_loss = student.consistency_loss(seq, target, teacher_diffu)
-                loss = args.cons_weight * cons_loss + args.ce_weight * ce_loss
+
+                cons_loss, ce_loss, contrast_loss = student.consistency_loss(
+                    seq, target, teacher_diffu,
+                    cons_weight=args.cons_weight,
+                    ce_weight=args.ce_weight,
+                    contrast_weight=contrast_weight,
+                    contrast_temperature=contrast_temperature,
+                )
+                loss = (args.cons_weight * cons_loss
+                        + args.ce_weight * ce_loss
+                        + contrast_weight * contrast_loss)
+
                 loss.backward()
                 optimizer.step()
                 student.update_ema()
+
                 running_cons += cons_loss.item()
                 running_ce += ce_loss.item()
+                running_contrast += contrast_loss.item()
                 n_b += 1
 
             avg_cons = running_cons / max(n_b, 1)
             avg_ce = running_ce / max(n_b, 1)
-            avg_total = args.cons_weight * avg_cons + args.ce_weight * avg_ce
+            avg_contrast = running_contrast / max(n_b, 1)
+            avg_total = (args.cons_weight * avg_cons
+                         + args.ce_weight * avg_ce
+                         + contrast_weight * avg_contrast)
 
-            msg = f'[Distill][Epoch {epoch}] cons={avg_cons:.4f} ce={avg_ce:.4f}'
+            msg = (f'[Distill][Epoch {epoch}] cons={avg_cons:.4f} '
+                   f'ce={avg_ce:.4f} contrast={avg_contrast:.4f}')
             print(msg)
             logger.info(msg)
 
             if loss_writer is not None:
-                loss_writer.writerow([epoch, avg_cons, avg_ce, avg_total])
+                loss_writer.writerow([epoch, avg_cons, avg_ce, avg_contrast, avg_total])
                 loss_f.flush()
 
             if epoch % args.distill_eval_interval == 0:

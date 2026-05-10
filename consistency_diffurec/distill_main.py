@@ -1,13 +1,14 @@
 """
-Entry point for consistency distillation of DiffuRec.
+Entry point for consistency distillation of DiffuRec — RCCD variant.
 
 Step 1: train (or load) the DiffuRec teacher.
 Step 2: initialize a student from the teacher.
-Step 3: train the student via consistency distillation.
+Step 3: train the student via Ranking-Aligned Contrastive Consistency
+        Distillation (RCCD).
 Step 4: evaluate the student at NFE = 1, 2, 4, 8 and compare to the
         teacher (NFE = T = diffusion_steps).
 
-Run from the `src/` directory.
+Run from the `consistency_diffurec/` directory.
 """
 import argparse
 import logging
@@ -63,7 +64,7 @@ def parse_args():
     p.add_argument('--rescale_timesteps', default=True)
     p.add_argument('--eval_interval', type=int, default=20)
     p.add_argument('--patience', type=int, default=5)
-    p.add_argument('--description', type=str, default='Distill')
+    p.add_argument('--description', type=str, default='RCCD')
     p.add_argument('--long_head', default=False)
     p.add_argument('--diversity_measure', default=False)
     p.add_argument('--epoch_time_avg', default=False)
@@ -81,6 +82,18 @@ def parse_args():
     p.add_argument('--cons_weight', type=float, default=1.0)
     p.add_argument('--ce_weight', type=float, default=1.0)
     p.add_argument('--ema_decay', type=float, default=0.95)
+
+    # ----- RCCD-specific -----
+    # contrast_weight: how strongly the InfoNCE term contributes.
+    # 0.5 is a safe starting value; if cons/ce dominate, push it up to 1.0;
+    # if InfoNCE is unstable (NaN, loss exploding), push it down to 0.1.
+    p.add_argument('--contrast_weight', type=float, default=0.5)
+    # contrast_temperature: softmax sharpness for InfoNCE.
+    # 0.1 is a standard CL4SRec / SimCLR starting value.
+    # Smaller (e.g. 0.05) -> harder negatives, can be unstable.
+    # Larger (e.g. 0.3) -> softer, often hurts ranking precision.
+    p.add_argument('--contrast_temperature', type=float, default=0.1)
+
     p.add_argument('--data_root', type=str, default='../datasets/data',
                    help='Override the dataset root directory if your layout differs.')
 
@@ -158,15 +171,27 @@ def main():
     print(f'Teacher latency (NFE=T): {teacher_ms:.4f} ms/sample')
     logger.info(f'Teacher latency (NFE=T): {teacher_ms:.4f} ms/sample')
 
-    # === Step 2 & 3: student via consistency distillation ===
+    # === Step 2 & 3: student via RCCD ===
     print('\n=== Initializing student ===')
     logger.info('=== Initializing student ===')
     student = ConsistencyStudent(teacher, args, ema_decay=args.ema_decay)
 
-    print('\n=== Running consistency distillation ===')
-    logger.info('=== Running consistency distillation ===')
+    print('\n=== Running RCCD ===')
+    logger.info('=== Running RCCD ===')
+    print(f'  contrast_weight={args.contrast_weight}, '
+          f'contrast_temperature={args.contrast_temperature}')
+    logger.info(f'  contrast_weight={args.contrast_weight}, '
+                f'contrast_temperature={args.contrast_temperature}')
+
+    # Path for per-epoch loss CSV (read by plots.py later).
+    log_dir = os.path.join('logs', args.dataset)
+    os.makedirs(log_dir, exist_ok=True)
+    csv_path = os.path.join(log_dir, f'rccd_seed_{args.random_seed}.csv')
+
     best_student = distill_train(
-        student, teacher.diffu, tra_loader, val_loader, test_loader, args, logger
+        student, teacher.diffu, tra_loader, val_loader, test_loader,
+        args, logger,
+        log_csv_path=csv_path,
     )
 
     os.makedirs(os.path.dirname(args.save_student_ckpt) or '.', exist_ok=True)
