@@ -8,9 +8,8 @@ with truncated DDIM (the "naive truncation" baseline) at the same NFEs.
 All results are written to a single JSON for downstream statistics + plots.
 
 Usage (from `consistency_diffurec/`):
-    PYTHONPATH=../DiffuRec/src python multi_seed_runner.py \
         --dataset amazon_beauty \
-        --data_root ../DiffuRec/datasets/data \
+        --data_root ../datasets/data \
         --teacher_epochs 200 \
         --distill_epochs 200 \
         --seeds 1997 42 2024 7 13 \
@@ -42,7 +41,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     # DiffuRec args (subset that matters)
     p.add_argument('--dataset', default='amazon_beauty')
-    p.add_argument('--data_root', default='../DiffuRec/datasets/data')
+    p.add_argument('--data_root', default='../datasets/data')
     p.add_argument('--max_len', type=int, default=50)
     p.add_argument('--device', default='cuda')
     p.add_argument('--num_gpu', type=int, default=1)
