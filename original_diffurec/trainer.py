@@ -7,6 +7,7 @@ import numpy as np
 import copy
 import time
 import pickle
+import glob
 
 
 def optimizers(model, args):
@@ -74,6 +75,49 @@ def LSHT_inference(model_joint, args, data_loader):
     print(test_metrics_dict_mean)
 
 
+def save_checkpoint(model, optimizer, epoch, checkpoint_dir, args):
+    checkpoint_path = os.path.join(checkpoint_dir, f'teacher_epoch_{epoch}.pt')
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'args': args,
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(f'[Checkpoint] saved to {checkpoint_path}')
+    return checkpoint_path
+
+
+def load_checkpoint(model, optimizer, checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    epoch = checkpoint['epoch']
+    print(f'[Checkpoint] loaded from {checkpoint_path} (epoch {epoch})')
+    return epoch
+
+
+def find_latest_checkpoint(checkpoint_dir):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoints = glob.glob(os.path.join(checkpoint_dir, 'teacher_epoch_*.pt'))
+    if not checkpoints:
+        return None, 0
+    
+    epochs_found = []
+    for c in checkpoints:
+        try:
+            epoch_num = int(c.split('_epoch_')[1].split('.')[0])
+            epochs_found.append((epoch_num, c))
+        except:
+            pass
+    
+    if not epochs_found:
+        return None, 0
+    
+    max_epoch, latest_path = max(epochs_found, key=lambda x: x[0])
+    return latest_path, max_epoch
+
+
 def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint, args, logger):
     epochs = args.epochs
     device = args.device
@@ -85,33 +129,31 @@ def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint,
     optimizer = optimizers(model_joint, args)
     lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.decay_step, gamma=args.gamma)
     
-
     start_epoch = 0
     checkpoint_dir = getattr(args, 'teacher_checkpoint_dir', 'checkpoints')
     os.makedirs(checkpoint_dir, exist_ok=True)
-
-    import glob
-    checkpoints = glob.glob(os.path.join(checkpoint_dir, 'teacher_epoch_*.pt'))
-    if checkpoints:
-        epochs_found = []
-        for c in checkpoints:
-            try:
-                epoch_num = int(c.split('_epoch_')[1].split('.')[0])
-                epochs_found.append(epoch_num)
-            except:
-                pass
-        if epochs_found:
-            start_epoch = max(epochs_found)
-            checkpoint_path = os.path.join(checkpoint_dir, f'teacher_epoch_{start_epoch}.pt')
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            model_joint.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            for _ in range(start_epoch):
-                lr_scheduler.step()
-            print(f'[Checkpoint] loaded from {checkpoint_path} (resuming from epoch {start_epoch})')
-            logger.info(f'[Checkpoint] loaded from {checkpoint_path} (resuming from epoch {start_epoch})')
-        else:
-            print('[Checkpoint] No valid checkpoint found, starting from epoch 0')
+    
+    latest_checkpoint, latest_epoch = find_latest_checkpoint(checkpoint_dir)
+    if latest_checkpoint is not None:
+        try:
+            checkpoint = torch.load(latest_checkpoint, map_location=device)
+            if 'model_state_dict' in checkpoint:
+                model_joint.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                start_epoch = checkpoint['epoch']
+                for _ in range(start_epoch):
+                    lr_scheduler.step()
+                print(f'[Checkpoint] loaded full checkpoint from {latest_checkpoint} (epoch {start_epoch})')
+                logger.info(f'[Checkpoint] loaded from {latest_checkpoint} (resuming from epoch {start_epoch})')
+            else:
+                model_joint.load_state_dict(checkpoint)
+                start_epoch = latest_epoch
+                print(f'[Checkpoint] loaded state_dict from {latest_checkpoint} (epoch {start_epoch})')
+                print(f'[Checkpoint] Warning: optimizer and scheduler NOT restored (old format)')
+                logger.info(f'[Checkpoint] loaded state_dict from {latest_checkpoint} (epoch {start_epoch})')
+        except Exception as e:
+            print(f'[Checkpoint] Error loading checkpoint: {e}, starting from epoch 0')
+            start_epoch = 0
     else:
         print('[Checkpoint] No checkpoint found, starting from epoch 0')
     
@@ -120,7 +162,7 @@ def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint,
     bad_count = 0
     best_model = None
     
-    for epoch_temp in range(start_epoch, epochs):  # ← начинаем с start_epoch
+    for epoch_temp in range(start_epoch, epochs):
         print('Epoch: {}'.format(epoch_temp))
         logger.info('Epoch: {}'.format(epoch_temp))
         model_joint.train()
@@ -130,7 +172,7 @@ def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint,
             train_batch = [x.to(device) for x in train_batch]
             optimizer.zero_grad()
             scores, diffu_rep, weights, t, item_rep_dis, seq_rep_dis = model_joint(train_batch[0], train_batch[1], train_flag=True)  
-            loss_diffu_value = model_joint.loss_diffu_ce(diffu_rep, train_batch[1])  ## use this not above
+            loss_diffu_value = model_joint.loss_diffu_ce(diffu_rep, train_batch[1])
           
             loss_all = loss_diffu_value
             loss_all.backward()
@@ -143,16 +185,7 @@ def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint,
         lr_scheduler.step()
 
         if (epoch_temp + 1) % 50 == 0:
-            checkpoint_path = os.path.join(checkpoint_dir, f'teacher_epoch_{epoch_temp + 1}.pt')
-            checkpoint = {
-                'epoch': epoch_temp + 1,
-                'model_state_dict': model_joint.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'args': args,
-            }
-            torch.save(checkpoint, checkpoint_path)
-            print(f'[Checkpoint] saved to {checkpoint_path}')
-            logger.info(f'[Checkpoint] saved to {checkpoint_path}')
+            save_checkpoint(model_joint, optimizer, epoch_temp + 1, checkpoint_dir, args)
 
         if epoch_temp != 0 and epoch_temp % args.eval_interval == 0:
             print('start predicting: ', datetime.datetime.now())
@@ -160,12 +193,10 @@ def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint,
             model_joint.eval()
             with torch.no_grad():
                 metrics_dict = {'HR@5': [], 'NDCG@5': [], 'HR@10': [], 'NDCG@10': [], 'HR@20': [], 'NDCG@20': []}
-                # metrics_dict_mean = {}
                 for val_batch in val_data_loader:
                     val_batch = [x.to(device) for x in val_batch]
                     scores_rec, rep_diffu, _, _, _, _ = model_joint(val_batch[0], val_batch[1], train_flag=False)
-                    scores_rec_diffu = model_joint.diffu_rep_pre(rep_diffu)    ### inner_production
-                    # scores_rec_diffu = model_joint.routing_rep_pre(rep_diffu)   ### routing_rep_pre
+                    scores_rec_diffu = model_joint.diffu_rep_pre(rep_diffu)
                     metrics = hrs_and_ndcgs_k(scores_rec_diffu, val_batch[1], metric_ks)
                     for k, v in metrics.items():
                         metrics_dict[k].append(v)
@@ -197,6 +228,16 @@ def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint,
     if args.eval_interval > epochs:
         best_model = copy.deepcopy(model_joint)
     
+    if best_model is not None:
+        best_model_path = os.path.join(checkpoint_dir, 'teacher_best.pt')
+        torch.save(best_model.state_dict(), best_model_path)
+        print(f'[Save] Best model saved to {best_model_path}')
+        logger.info(f'[Save] Best model saved to {best_model_path}')
+    
+    final_model_path = os.path.join(checkpoint_dir, 'teacher_final.pt')
+    torch.save(model_joint.state_dict(), final_model_path)
+    print(f'[Save] Final model saved to {final_model_path}')
+    logger.info(f'[Save] Final model saved to {final_model_path}')
     
     top_100_item = []
     with torch.no_grad():
@@ -205,8 +246,7 @@ def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint,
         for test_batch in test_data_loader:
             test_batch = [x.to(device) for x in test_batch]
             scores_rec, rep_diffu, _, _, _, _ = best_model(test_batch[0], test_batch[1], train_flag=False)
-            scores_rec_diffu = best_model.diffu_rep_pre(rep_diffu)   ### Inner Production
-            # scores_rec_diffu = best_model.routing_rep_pre(rep_diffu)   ### routing
+            scores_rec_diffu = best_model.diffu_rep_pre(rep_diffu)
             
             _, indices = torch.topk(scores_rec_diffu, k=100)
             top_100_item.append(indices)
@@ -247,26 +287,4 @@ def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint,
         with open(path_data_category, 'wb') as f:
             pickle.dump(category_list_100, f)
             
-
     return best_model, test_metrics_dict_mean
-
-
-def save_checkpoint(model, optimizer, epoch, args, path):
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'args': args,
-    }
-    torch.save(checkpoint, path)
-    print(f'[Checkpoint] saved to {path}')
-
-
-def load_checkpoint(model, optimizer, path, device):
-    checkpoint = torch.load(path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    epoch = checkpoint['epoch']
-    print(f'[Checkpoint] loaded from {path} (epoch {epoch})')
-    return epoch
-    
