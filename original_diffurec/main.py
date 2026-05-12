@@ -18,6 +18,8 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', default='amazon_beauty', help='Dataset name: toys, amazon_beauty, steam, ml-1m')
 parser.add_argument('--log_file', default='log/', help='log dir path')
+parser.add_argument('--data_root', type=str, default='../datasets/data',
+                   help='Root directory for datasets')
 parser.add_argument('--teacher_checkpoint_dir', type=str, default='checkpoints',
                    help='Directory to save/load teacher checkpoints')
 parser.add_argument('--random_seed', type=int, default=1997, help='Random seed')  
