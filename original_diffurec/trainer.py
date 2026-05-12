@@ -1,4 +1,5 @@
 import torch.nn as nn
+import os
 import torch.optim as optim
 import datetime
 import torch
@@ -83,11 +84,43 @@ def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint,
         model_joint = nn.DataParallel(model_joint)
     optimizer = optimizers(model_joint, args)
     lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.decay_step, gamma=args.gamma)
+    
+
+    start_epoch = 0
+    checkpoint_dir = getattr(args, 'teacher_checkpoint_dir', 'checkpoints')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    import glob
+    checkpoints = glob.glob(os.path.join(checkpoint_dir, 'teacher_epoch_*.pt'))
+    if checkpoints:
+        epochs_found = []
+        for c in checkpoints:
+            try:
+                epoch_num = int(c.split('_epoch_')[1].split('.')[0])
+                epochs_found.append(epoch_num)
+            except:
+                pass
+        if epochs_found:
+            start_epoch = max(epochs_found)
+            checkpoint_path = os.path.join(checkpoint_dir, f'teacher_epoch_{start_epoch}.pt')
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model_joint.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            for _ in range(start_epoch):
+                lr_scheduler.step()
+            print(f'[Checkpoint] loaded from {checkpoint_path} (resuming from epoch {start_epoch})')
+            logger.info(f'[Checkpoint] loaded from {checkpoint_path} (resuming from epoch {start_epoch})')
+        else:
+            print('[Checkpoint] No valid checkpoint found, starting from epoch 0')
+    else:
+        print('[Checkpoint] No checkpoint found, starting from epoch 0')
+    
     best_metrics_dict = {'Best_HR@5': 0, 'Best_NDCG@5': 0, 'Best_HR@10': 0, 'Best_NDCG@10': 0, 'Best_HR@20': 0, 'Best_NDCG@20': 0}
     best_epoch = {'Best_epoch_HR@5': 0, 'Best_epoch_NDCG@5': 0, 'Best_epoch_HR@10': 0, 'Best_epoch_NDCG@10': 0, 'Best_epoch_HR@20': 0, 'Best_epoch_NDCG@20': 0}
     bad_count = 0
+    best_model = None
     
-    for epoch_temp in range(epochs):        
+    for epoch_temp in range(start_epoch, epochs):  # ← начинаем с start_epoch
         print('Epoch: {}'.format(epoch_temp))
         logger.info('Epoch: {}'.format(epoch_temp))
         model_joint.train()
@@ -108,6 +141,18 @@ def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint,
                 logger.info('[%d/%d] Loss: %.4f' % (index_temp, len(tra_data_loader), loss_all.item()))
         print("loss in epoch {}: {}".format(epoch_temp, loss_all.item()))
         lr_scheduler.step()
+
+        if (epoch_temp + 1) % 50 == 0:
+            checkpoint_path = os.path.join(checkpoint_dir, f'teacher_epoch_{epoch_temp + 1}.pt')
+            checkpoint = {
+                'epoch': epoch_temp + 1,
+                'model_state_dict': model_joint.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'args': args,
+            }
+            torch.save(checkpoint, checkpoint_path)
+            print(f'[Checkpoint] saved to {checkpoint_path}')
+            logger.info(f'[Checkpoint] saved to {checkpoint_path}')
 
         if epoch_temp != 0 and epoch_temp % args.eval_interval == 0:
             print('start predicting: ', datetime.datetime.now())
@@ -142,8 +187,9 @@ def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint,
                 logger.info(best_epoch)
                 best_model = copy.deepcopy(model_joint)
             if bad_count >= args.patience:
+                print(f'Early stopping at epoch {epoch_temp}')
+                logger.info(f'Early stopping at epoch {epoch_temp}')
                 break
-            
     
     logger.info(best_metrics_dict)
     logger.info(best_epoch)
@@ -203,4 +249,24 @@ def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint,
             
 
     return best_model, test_metrics_dict_mean
+
+
+def save_checkpoint(model, optimizer, epoch, args, path):
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'args': args,
+    }
+    torch.save(checkpoint, path)
+    print(f'[Checkpoint] saved to {path}')
+
+
+def load_checkpoint(model, optimizer, path, device):
+    checkpoint = torch.load(path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    epoch = checkpoint['epoch']
+    print(f'[Checkpoint] loaded from {path} (epoch {epoch})')
+    return epoch
     
