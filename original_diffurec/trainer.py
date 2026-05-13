@@ -136,7 +136,7 @@ def model_train(tra_data_loader, val_data_loader, test_data_loader, model_joint,
     latest_checkpoint, latest_epoch = find_latest_checkpoint(checkpoint_dir)
     if latest_checkpoint is not None:
         try:
-            checkpoint = torch.load(latest_checkpoint, map_location=device)
+            checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
             if 'model_state_dict' in checkpoint:
                 model_joint.load_state_dict(checkpoint['model_state_dict'])
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
