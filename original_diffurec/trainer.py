@@ -89,7 +89,7 @@ def save_checkpoint(model, optimizer, epoch, checkpoint_dir, args):
 
 
 def load_checkpoint(model, optimizer, checkpoint_path, device):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     epoch = checkpoint['epoch']
