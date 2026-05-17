@@ -1,0 +1,56 @@
+{
+  "run_name": "seed1997_beta2.0_tau0.05",
+  "dataset": "toys",
+  "random_seed": 1997,
+  "contrast_weight": 2.0,
+  "contrast_temperature": 0.05,
+  "best_val_HR10": 9.7704,
+  "best_epoch": 105,
+  "test_metrics_per_nfe": {
+    "1": {
+      "HR@5": 5.8281,
+      "HR@10": 7.791,
+      "HR@20": 10.4422,
+      "NDCG@5": 4.3247,
+      "NDCG@10": 4.9557,
+      "NDCG@20": 5.6242
+    },
+    "2": {
+      "HR@5": 5.8281,
+      "HR@10": 7.7859,
+      "HR@20": 10.4525,
+      "NDCG@5": 4.3231,
+      "NDCG@10": 4.9526,
+      "NDCG@20": 5.6248
+    },
+    "4": {
+      "HR@5": 5.8281,
+      "HR@10": 7.7966,
+      "HR@20": 10.4525,
+      "NDCG@5": 4.3256,
+      "NDCG@10": 4.9582,
+      "NDCG@20": 5.6276
+    },
+    "8": {
+      "HR@5": 5.8281,
+      "HR@10": 7.7966,
+      "HR@20": 10.4474,
+      "NDCG@5": 4.3252,
+      "NDCG@10": 4.9577,
+      "NDCG@20": 5.6259
+    }
+  },
+  "latency_per_nfe_ms": {
+    "1": 0.06819690577685833,
+    "2": 0.13832523487508297,
+    "4": 0.2724641840904951,
+    "8": 0.5490671657025814
+  },
+  "artifact_paths": {
+    "student_checkpoint": "/content/diffurec-distillation/consistency_diffurec/artifacts/toys/seed1997_beta2.0_tau0.05/student_final.pt",
+    "test_predictions": "/content/diffurec-distillation/consistency_diffurec/artifacts/toys/seed1997_beta2.0_tau0.05/test_predictions_nfe1.npz",
+    "config": "/content/diffurec-distillation/consistency_diffurec/artifacts/toys/seed1997_beta2.0_tau0.05/config.json",
+    "loss_csv": "/content/diffurec-distillation/consistency_diffurec/logs/toys/seed1997_beta2.0_tau0.05.csv",
+    "val_csv": "/content/diffurec-distillation/consistency_diffurec/logs/toys/seed1997_beta2.0_tau0.05.csv.val.csv"
+  }
+}
