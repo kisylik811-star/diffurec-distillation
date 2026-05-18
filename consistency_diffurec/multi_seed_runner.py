@@ -1,26 +1,29 @@
 """
-Multi-seed experiment runner for the consistency distillation pipeline.
+Multi-seed evaluation runner for consistency distillation.
 
-Runs the teacher once (cached on disk), then trains students with different
-random seeds, evaluating each at NFE = 1, 2, 4, 8. Also evaluates the teacher
-with truncated DDIM (the "naive truncation" baseline) at the same NFEs.
+Runs the teacher ONCE (cached), then for each of 5 evaluation seeds trains:
+  - RCCD student   (full architecture with InfoNCE contrastive loss)
+  - CD-only student (β=0, ablation baseline)
 
-All results are written to a single JSON for downstream statistics + plots.
+Evaluates each at NFE ∈ {1, 2, 4, 8} → inference-steps ablation comes for free.
+Measures 1000-inference latency at NFE=1, batch_size=1, seed=1907 (single
+measurement; latency is hardware-dependent and seed-invariant).
 
-Usage (from `consistency_diffurec/`):
-        --dataset amazon_beauty \
-        --data_root ../datasets/data \
-        --teacher_epochs 200 \
-        --distill_epochs 200 \
-        --seeds 1997 42 2024 7 13 \
-        --out_json results/beauty_multiseed.json
+NOTE: Teacher is trained on a single seed (no variance available).
+      Reported student-vs-teacher comparisons should use one-sample Wilcoxon
+      as a conservative test, with effect size reported alongside.
+
+Default seeds {1907, 1977, 2015, 23, 88} are *evaluation* seeds; for
+hyperparameter selection use {1994, 2024, 91} in hp_selection.py.
+
+All artifacts under DRIVE_BASE = /content/drive/MyDrive/...
 """
 import argparse
-import copy
 import json
 import os
 import pickle
 import random
+import shutil
 import time
 from pathlib import Path
 
@@ -33,13 +36,25 @@ from model import create_model_diffu, Att_Diffuse_model
 from trainer import model_train
 
 from consistency_diffurec import ConsistencyStudent
-from distill_trainer import distill_train, evaluate_at_nfe, evaluate_teacher_full_nfe
+from distill_trainer import (
+    distill_train, evaluate_at_nfe, evaluate_teacher_full_nfe,
+)
 from evaluation import evaluate_teacher_truncated, measure_latency_grid
+
+DRIVE_BASE = '/content/drive/MyDrive/diffurec-distillation-results/consistency-diffurec-after-sweep'
+ARTIFACTS_ROOT = f'{DRIVE_BASE}/artifacts'
+LOGS_ROOT = f'{DRIVE_BASE}/logs'
+RESULTS_ROOT = f'{DRIVE_BASE}/artifacts/results'
+
+# Seed for the single-shot latency measurement (deterministic init only;
+# latency itself is invariant to seed).
+LATENCY_SEED = 1907
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    # DiffuRec args (subset that matters)
+
+    # ----- DiffuRec args -----
     p.add_argument('--dataset', default='amazon_beauty')
     p.add_argument('--data_root', default='../datasets/data')
     p.add_argument('--max_len', type=int, default=50)
@@ -67,19 +82,24 @@ def parse_args():
     p.add_argument('--eval_interval', type=int, default=20)
     p.add_argument('--patience', type=int, default=5)
     p.add_argument('--description', default='multiseed')
-    p.add_argument('--log_file', default='log/')
+    p.add_argument('--log_file', default=LOGS_ROOT)
     p.add_argument('--long_head', default=False)
     p.add_argument('--diversity_measure', default=False)
     p.add_argument('--epoch_time_avg', default=False)
 
-    # Teacher
+    # ----- Teacher -----
     p.add_argument('--teacher_epochs', type=int, default=200)
-    p.add_argument('--teacher_ckpt', default=None,
-                   help='Reuse a pre-trained teacher checkpoint if provided.')
-    p.add_argument('--save_teacher_ckpt', default='checkpoints/teacher_{dataset}.pt')
+    p.add_argument('--teacher_ckpt', default=None)
+    p.add_argument('--save_teacher_ckpt',
+                   default=f'{ARTIFACTS_ROOT}/{{dataset}}/teacher/teacher.pt')
 
-    # Distillation
-    p.add_argument('--distill_lr', type=float, default=1e-3)
+    # ----- Distillation hyperparameters (selected on Toys via hp_selection.py) -----
+    p.add_argument('--distill_lr', type=float, default=1e-3,
+                   help='Student learning rate (selected on Toys grid).')
+    p.add_argument('--contrast_weight', type=float, default=2.0,
+                   help='InfoNCE loss weight β (selected on Toys grid).')
+    p.add_argument('--contrast_temperature', type=float, default=0.1,
+                   help='InfoNCE temperature τ (selected on Toys grid).')
     p.add_argument('--distill_epochs', type=int, default=200)
     p.add_argument('--distill_eval_interval', type=int, default=5)
     p.add_argument('--distill_patience', type=int, default=10)
@@ -87,15 +107,29 @@ def parse_args():
     p.add_argument('--ce_weight', type=float, default=1.0)
     p.add_argument('--ema_decay', type=float, default=0.95)
 
-    # Multi-seed
-    p.add_argument('--seeds', type=int, nargs='+', default=[1997, 42, 2024, 7, 13])
-    p.add_argument('--teacher_seed', type=int, default=1997)
-    p.add_argument('--nfe_grid', type=int, nargs='+', default=[1, 2, 4, 8, 16, 32])
-    p.add_argument('--out_json', default='results/multiseed.json')
+    # ----- Multi-seed evaluation -----
+    p.add_argument('--seeds', type=int, nargs='+',
+                   default=[1907, 1977, 2015, 23, 88],
+                   help='Evaluation seeds. Disjoint from selection seeds '
+                        '{1994, 2024, 91} used by hp_selection.py.')
+    p.add_argument('--teacher_seed', type=int, default=1907,
+                   help='Seed used for teacher training. Single value — '
+                        'teacher has no reported variance.')
+    p.add_argument('--nfe_grid', type=int, nargs='+', default=[1, 2, 4, 8],
+                   help='NFE values evaluated for inference-steps ablation.')
+    p.add_argument('--run_ablation', action='store_true', default=True,
+                   help='Run CD-only baseline (β=0) alongside RCCD for ablation.')
+    p.add_argument('--no_ablation', dest='run_ablation', action='store_false')
+    p.add_argument('--out_json', default=None,
+                   help='Output JSON path. Default: '
+                        '{DRIVE_BASE}/artifacts/results/multiseed_{dataset}.json')
 
-    # Required by Att_Diffuse_model but not parsed in main: filled later
+    # ----- 1000-inference latency table -----
+    p.add_argument('--latency_n_runs', type=int, default=1000)
+    p.add_argument('--latency_batch_size', type=int, default=1)
+
     args = p.parse_args()
-    args.epochs = args.teacher_epochs  # used by trainer for teacher
+    args.epochs = args.teacher_epochs
     return args
 
 
@@ -108,6 +142,10 @@ def fix_seed(s):
     cudnn.benchmark = False
 
 
+class _DummyLogger:
+    def info(self, *a, **k): pass
+
+
 def load_data(args):
     path = os.path.join(args.data_root, args.dataset, 'dataset.pkl')
     with open(path, 'rb') as f:
@@ -115,36 +153,89 @@ def load_data(args):
     args.item_num = len(data_raw['smap'])
     tra = Data_Train(data_raw['train'], args).get_pytorch_dataloaders()
     val = Data_Val(data_raw['train'], data_raw['val'], args).get_pytorch_dataloaders()
-    tst = Data_Test(data_raw['train'], data_raw['val'], data_raw['test'], args).get_pytorch_dataloaders()
+    tst = Data_Test(data_raw['train'], data_raw['val'], data_raw['test'],
+                    args).get_pytorch_dataloaders()
     return tra, val, tst
 
 
-class _DummyLogger:
-    def info(self, *a, **k): pass
+def _build_latency_loader(args, target_batch_size):
+    """Build a separate test loader with batch_size=1 for accurate per-query latency."""
+    saved_bs = args.batch_size
+    args.batch_size = target_batch_size
+    path = os.path.join(args.data_root, args.dataset, 'dataset.pkl')
+    with open(path, 'rb') as f:
+        data_raw = pickle.load(f)
+    args.item_num = len(data_raw['smap'])
+    loader = Data_Test(data_raw['train'], data_raw['val'], data_raw['test'],
+                       args).get_pytorch_dataloaders()
+    args.batch_size = saved_bs
+    return loader
+
+
+@torch.no_grad()
+def measure_single_query_latency(model, loader, device, n_warmup=100, n_runs=1000,
+                                 mode='student', num_steps=1):
+    """Per-query (batch_size=1) latency, averaged over n_runs forward passes.
+
+    Single-shot measurement; latency is hardware-dependent and seed-invariant,
+    so we do not aggregate across evaluation seeds.
+    """
+    seq, target = next(iter(loader))
+    seq, target = seq.to(device), target.to(device)
+    model.eval()
+
+    def _run_once():
+        if mode == 'student':
+            return model.predict_scores(seq, num_steps=num_steps)
+        _, rep, *_ = model(seq, target, train_flag=False)
+        return model.diffu_rep_pre(rep)
+
+    for _ in range(n_warmup):
+        _ = _run_once()
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(n_runs):
+        _ = _run_once()
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    total_ms = (time.time() - t0) * 1000.0
+    return total_ms / n_runs / seq.size(0)
 
 
 def main():
     args = parse_args()
     args.save_teacher_ckpt = args.save_teacher_ckpt.format(dataset=args.dataset)
+    if args.out_json is None:
+        args.out_json = f'{RESULTS_ROOT}/multiseed_{args.dataset}.json'
+
     Path(os.path.dirname(args.out_json) or '.').mkdir(parents=True, exist_ok=True)
     Path(os.path.dirname(args.save_teacher_ckpt) or '.').mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device)
     logger = _DummyLogger()
 
-    # --- Load data once ---
+    print(f'[Config] β={args.contrast_weight}, τ={args.contrast_temperature}, '
+          f'lr={args.distill_lr}')
+    print(f'[Config] eval seeds: {args.seeds}')
+    print(f'[Config] ablation (CD-only β=0): {"YES" if args.run_ablation else "NO"}')
+    print(f'[Config] output: {args.out_json}')
+
+    # --- Load data once at teacher seed ---
     fix_seed(args.teacher_seed)
     tra_loader, val_loader, test_loader = load_data(args)
     print(f'[Data] {args.dataset}: item_num={args.item_num}')
 
     results = {
-        'dataset':  args.dataset,
-        'config':   {k: v for k, v in vars(args).items()
-                     if isinstance(v, (int, float, str, bool, list))},
-        'teacher':  {},
-        'students': {},     # keyed by seed
-        'baseline': {},     # truncated teacher at varying NFE
-        'latency':  {},
+        'dataset': args.dataset,
+        'config': {k: v for k, v in vars(args).items()
+                   if isinstance(v, (int, float, str, bool, list, type(None)))},
+        'teacher': {},
+        'students': {},            # keyed by seed → RCCD
+        'students_baseline': {},   # keyed by seed → CD-only (β=0)
+        'baseline': {},            # truncated teacher (NFE varying)
+        'baseline_val': {},
+        'latency': {},
     }
 
     # --- Teacher ---
@@ -154,68 +245,131 @@ def main():
         print(f'[Teacher] loading from {teacher_ckpt}')
         teacher.load_state_dict(torch.load(teacher_ckpt, map_location=device))
     else:
-        print(f'[Teacher] training from scratch ({args.teacher_epochs} epochs)')
+        print(f'[Teacher] training from scratch ({args.teacher_epochs} epochs, '
+              f'seed={args.teacher_seed})')
         teacher, _ = model_train(tra_loader, val_loader, test_loader, teacher, args, logger)
         torch.save(teacher.state_dict(), args.save_teacher_ckpt)
-        print(f'[Teacher] saved to {args.save_teacher_ckpt}')
+        # Also save a copy under artifacts/<dataset>/teacher/
+        teacher_dir = Path(ARTIFACTS_ROOT) / args.dataset / 'teacher'
+        teacher_dir.mkdir(parents=True, exist_ok=True)
+        copy_path = teacher_dir / 'teacher.pt'
+        if not copy_path.exists():
+            shutil.copy(args.save_teacher_ckpt, copy_path)
+        # Save teacher config
+        with open(teacher_dir / 'config.json', 'w') as f:
+            json.dump({k: v for k, v in vars(args).items()
+                       if isinstance(v, (int, float, str, bool, list, type(None)))},
+                      f, indent=2)
 
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
 
-    print('[Teacher] evaluating at full NFE on test and val')
+    print('[Teacher] full-NFE eval')
     results['teacher']['full_nfe']     = evaluate_teacher_full_nfe(teacher, test_loader, device)
     results['teacher']['full_nfe_val'] = evaluate_teacher_full_nfe(teacher, val_loader, device)
     results['teacher']['T'] = args.diffusion_steps
+    results['teacher']['_single_seed_note'] = (
+        'Teacher trained on a single seed; reported variance is for students only. '
+        'Use one-sample Wilcoxon (conservative) for student-vs-teacher tests.'
+    )
 
-    # --- Baseline: teacher with truncated DDIM (test and val) ---
-    print('[Baseline] truncated DDIM at varying NFE (test and val)')
-    results['baseline_val'] = {}
+    print('[Baseline] truncated DDIM at varying NFE')
     for nfe in args.nfe_grid:
         m_test = evaluate_teacher_truncated(teacher, test_loader, num_steps=nfe, device=device)
-        m_val  = evaluate_teacher_truncated(teacher, val_loader,  num_steps=nfe, device=device)
-        results['baseline'][str(nfe)]     = m_test
+        m_val = evaluate_teacher_truncated(teacher, val_loader, num_steps=nfe, device=device)
+        results['baseline'][str(nfe)] = m_test
         results['baseline_val'][str(nfe)] = m_val
-        print(f'  truncated NFE={nfe}: test={m_test}  val={m_val}')
+        print(f'  truncated NFE={nfe}: test={m_test}')
 
-    # --- Multi-seed students ---
+    # --- Per-seed loop: RCCD + (optionally) CD-only ---
+    target_beta, target_tau = args.contrast_weight, args.contrast_temperature
+    seed_configs = [('rccd', target_beta, target_tau)]
+    if args.run_ablation:
+        seed_configs.append(('baseline', 0.0, target_tau))
+
+    final_student_for_latency = None
+
     for seed in args.seeds:
         print(f'\n========== Seed {seed} ==========')
-        fix_seed(seed)
+        for variant_name, beta, tau in seed_configs:
+            args.random_seed = seed
+            args.contrast_weight = beta
+            args.contrast_temperature = tau
 
-        # Reload data with this seed (reshuffles training order via DataLoader)
-        tra_s, val_s, tst_s = load_data(args)
+            print(f'\n  [Variant: {variant_name}] β={beta}, τ={tau}, '
+                  f'lr={args.distill_lr}, seed={seed}')
 
-        student = ConsistencyStudent(teacher, args, ema_decay=args.ema_decay).to(device)
+            fix_seed(seed)
+            tra_s, val_s, tst_s = load_data(args)
+            student = ConsistencyStudent(teacher, args,
+                                         ema_decay=args.ema_decay).to(device)
 
-        # Per-seed CSV path. Lives in `logs/<dataset>/seed_<seed>.csv` so that
-        # plots.py can load any/all of them later.
-        log_dir = os.path.join('logs', args.dataset)
-        os.makedirs(log_dir, exist_ok=True)
-        csv_path = os.path.join(log_dir, f'seed_{seed}.csv')
+            run_name = (f"seed{seed}_beta{beta}_tau{tau}"
+                        + ('_baseline' if variant_name == 'baseline' else ''))
+            log_dir = os.path.join(LOGS_ROOT, args.dataset)
+            os.makedirs(log_dir, exist_ok=True)
+            csv_path = os.path.join(log_dir, f'{run_name}.csv')
 
-        best_student = distill_train(
-            student, teacher.diffu, tra_s, val_s, tst_s,
-            args, logger,
-            log_csv_path=csv_path,
-        )
+            best_student = distill_train(
+                student, teacher.diffu, tra_s, val_s, tst_s,
+                args, logger, log_csv_path=csv_path, run_name=run_name,
+            )
 
-        seed_results = {'_log_csv': csv_path, '_val': {}}
-        for nfe in args.nfe_grid:
-            m_test = evaluate_at_nfe(best_student, tst_s, num_steps=nfe, device=device)
-            m_val  = evaluate_at_nfe(best_student, val_s, num_steps=nfe, device=device)
-            seed_results[str(nfe)]         = m_test
-            seed_results['_val'][str(nfe)] = m_val
-            print(f'  Student seed={seed} NFE={nfe}: test={m_test}  val={m_val}')
-        results['students'][str(seed)] = seed_results
+            seed_data = {'_run_name': run_name, '_val': {}}
+            for nfe in args.nfe_grid:
+                m_test = evaluate_at_nfe(best_student, tst_s, num_steps=nfe, device=device)
+                m_val = evaluate_at_nfe(best_student, val_s, num_steps=nfe, device=device)
+                seed_data[str(nfe)] = m_test
+                seed_data['_val'][str(nfe)] = m_val
+                print(f'    seed={seed} [{variant_name}] NFE={nfe}: '
+                      f'test={m_test["HR@10"]:.4f}  val={m_val["HR@10"]:.4f}')
 
-    # --- Latency grid (one batch is enough) ---
-    print('\n[Latency] measuring on first test batch')
+            store_key = 'students' if variant_name == 'rccd' else 'students_baseline'
+            results[store_key][str(seed)] = seed_data
+
+            if variant_name == 'rccd' and seed == LATENCY_SEED:
+                final_student_for_latency = best_student
+
+        # Save intermediate results after every seed in case of interruption
+        with open(args.out_json, 'w') as f:
+            json.dump(results, f, indent=2, default=float)
+
+    # --- Latency: grid + 1000-inference single-query measurement on seed=1907 ---
+    print('\n[Latency] grid measurement (bs=test_default)')
     sample_batch = next(iter(test_loader))
-    final_student = best_student  # last trained student is fine for latency
+    if final_student_for_latency is None:
+        # Fallback: use the last trained student
+        final_student_for_latency = best_student
     results['latency'] = measure_latency_grid(
-        teacher, final_student, sample_batch, device, args.nfe_grid
+        teacher, final_student_for_latency, sample_batch, device, args.nfe_grid,
     )
+
+    print(f'[Latency] single-query measurement '
+          f'(batch_size={args.latency_batch_size}, n_runs={args.latency_n_runs}, '
+          f'seed={LATENCY_SEED}, NFE=1)')
+    fix_seed(LATENCY_SEED)
+    bs1_loader = _build_latency_loader(args, target_batch_size=args.latency_batch_size)
+
+    t_lat_1q = measure_single_query_latency(
+        teacher, bs1_loader, device,
+        n_runs=args.latency_n_runs, mode='teacher',
+    )
+    s_lat_1q = measure_single_query_latency(
+        final_student_for_latency, bs1_loader, device,
+        n_runs=args.latency_n_runs, mode='student', num_steps=1,
+    )
+    results['latency_single_query'] = {
+        'batch_size': args.latency_batch_size,
+        'n_runs':     args.latency_n_runs,
+        'seed':       LATENCY_SEED,
+        'teacher_ms':       t_lat_1q,
+        'student_ms_nfe1':  s_lat_1q,
+        'speedup':          t_lat_1q / s_lat_1q if s_lat_1q > 0 else float('inf'),
+    }
+    print(f'  Teacher (NFE={args.diffusion_steps}): {t_lat_1q:.4f} ms/query')
+    print(f'  RCCD    (NFE=1):                      {s_lat_1q:.4f} ms/query')
+    print(f'  Speedup: {results["latency_single_query"]["speedup"]:.2f}x')
 
     # --- Persist ---
     with open(args.out_json, 'w') as f:
