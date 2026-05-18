@@ -1487,7 +1487,7 @@ def main():
                                          artifacts_root=args.artifacts_root)
 
     if args.mode == 'pareto_runs':
-        if not args.dataset:
+        if not args.dataset: 
             raise SystemExit('pareto_runs needs --dataset')
         baseline_rn = f'seed1997_beta0.0_tau0.1'
         best_rn = f'seed1997_beta{args.beta_target}_tau{args.tau_target}'
