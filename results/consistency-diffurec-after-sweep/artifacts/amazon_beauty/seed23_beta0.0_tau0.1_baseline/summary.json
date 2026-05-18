@@ -1,0 +1,56 @@
+{
+  "run_name": "seed23_beta0.0_tau0.1_baseline",
+  "dataset": "amazon_beauty",
+  "random_seed": 23,
+  "contrast_weight": 0.0,
+  "contrast_temperature": 0.1,
+  "best_val_HR10": 9.9619,
+  "best_epoch": 50,
+  "test_metrics_per_nfe": {
+    "1": {
+      "HR@5": 5.5023,
+      "HR@10": 7.9594,
+      "HR@20": 10.8594,
+      "NDCG@5": 4.0121,
+      "NDCG@10": 4.8077,
+      "NDCG@20": 5.5397
+    },
+    "2": {
+      "HR@5": 5.5576,
+      "HR@10": 7.9594,
+      "HR@20": 10.8638,
+      "NDCG@5": 4.0356,
+      "NDCG@10": 4.8115,
+      "NDCG@20": 5.5445
+    },
+    "4": {
+      "HR@5": 5.5576,
+      "HR@10": 7.9594,
+      "HR@20": 10.8638,
+      "NDCG@5": 4.0365,
+      "NDCG@10": 4.8123,
+      "NDCG@20": 5.5454
+    },
+    "8": {
+      "HR@5": 5.5443,
+      "HR@10": 7.9594,
+      "HR@20": 10.8594,
+      "NDCG@5": 4.0305,
+      "NDCG@10": 4.811,
+      "NDCG@20": 5.5431
+    }
+  },
+  "latency_per_nfe_ms": {
+    "1": 0.06899584084749222,
+    "2": 0.14609349891543388,
+    "4": 0.2791540790349245,
+    "8": 0.5643886886537075
+  },
+  "artifact_paths": {
+    "student_checkpoint": "/content/diffurec-distillation/consistency_diffurec/artifacts/amazon_beauty/seed23_beta0.0_tau0.1_baseline/student_final.pt",
+    "test_predictions": "/content/diffurec-distillation/consistency_diffurec/artifacts/amazon_beauty/seed23_beta0.0_tau0.1_baseline/test_predictions_nfe1.npz",
+    "config": "/content/diffurec-distillation/consistency_diffurec/artifacts/amazon_beauty/seed23_beta0.0_tau0.1_baseline/config.json",
+    "loss_csv": "/content/diffurec-distillation/consistency_diffurec/logs/amazon_beauty/seed23_beta0.0_tau0.1_baseline.csv",
+    "val_csv": "/content/diffurec-distillation/consistency_diffurec/logs/amazon_beauty/seed23_beta0.0_tau0.1_baseline.csv.val.csv"
+  }
+}
