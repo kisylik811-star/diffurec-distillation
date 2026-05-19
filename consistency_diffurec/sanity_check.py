@@ -18,11 +18,9 @@ Usage:
       --sanity_seed 1994
 """
 import argparse
-import json
 import os
 import pickle
 import random
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -104,12 +102,8 @@ def parse_args():
                    help='Single seed for sanity check. Must be a SELECTION seed, '
                         'not an evaluation seed.')
 
-    p.add_argument('--out_json', default=None)
-
     args = p.parse_args()
     args.epochs = args.teacher_epochs
-    if args.out_json is None:
-        args.out_json = f'{ARTIFACTS_ROOT}/sanity_check/sanity_check_results.json'
     if args.tau_window is None:
         args.tau_window = [args.best_tau * 0.5, args.best_tau, args.best_tau * 2.0]
     return args
@@ -204,7 +198,6 @@ def run_for_dataset(args, dataset, logger):
 
 def main():
     args = parse_args()
-    Path(os.path.dirname(args.out_json) or '.').mkdir(parents=True, exist_ok=True)
     logger = _DummyLogger()
 
     print(f'=== Sanity check ===')
@@ -236,10 +229,6 @@ def main():
         for tau, hr in info['tau_results'].items():
             star = ' ★' if tau == info['best_tau_local'] else ''
             print(f'    τ={tau}: val HR@10 = {hr:.4f}{star}')
-
-    with open(args.out_json, 'w') as f:
-        json.dump(summary, f, indent=2, default=float)
-    print(f'\n[Save] {args.out_json}')
 
 
 if __name__ == '__main__':

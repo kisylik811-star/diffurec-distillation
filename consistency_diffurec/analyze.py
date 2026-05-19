@@ -861,7 +861,140 @@ def length_aware_compare(dataset, artifacts_root, run_names, labels=None, n_bins
 
 
 # ===================================================================
-# Section 9: CLI
+# Section 9: latency measurement from checkpoints (merged from latency_table.py)
+# ===================================================================
+
+def _measure_latency_from_checkpoints(datasets, artifacts_root, data_root,
+                                      seed, beta, tau,
+                                      n_runs=1000, n_warmup=100,
+                                      nfe_student=1, device_str='cuda',
+                                      diffusion_steps=32, max_len=50,
+                                      batch_size=1, **arch_kwargs):
+    """Load trained checkpoints, measure 1000-inference latency at bs=1 NFE=1.
+
+    Reuses ConsistencyStudent / Att_Diffuse_model from the main pipeline.
+    Output: list of rows for inline table display.
+    """
+    # Lazy imports — only loaded when this mode is invoked
+    import time
+    import pickle
+    import random
+    import torch
+    import torch.backends.cudnn as cudnn
+    from utils import Data_Test
+    from model import create_model_diffu, Att_Diffuse_model
+    from consistency_diffurec import ConsistencyStudent
+    from distill_trainer import evaluate_at_nfe, evaluate_teacher_full_nfe
+
+    class _A: pass
+    args_ns = _A()
+    args_ns.max_len = max_len
+    args_ns.batch_size = batch_size
+    args_ns.diffusion_steps = diffusion_steps
+    for k, v in arch_kwargs.items():
+        setattr(args_ns, k, v)
+    # Reasonable defaults if not overridden
+    for k, v in [('hidden_size', 128), ('dropout', 0.1), ('emb_dropout', 0.3),
+                 ('hidden_act', 'gelu'), ('num_blocks', 4),
+                 ('lambda_uncertainty', 0.001), ('noise_schedule', 'trunc_lin'),
+                 ('rescale_timesteps', True),
+                 ('schedule_sampler_name', 'lossaware')]:
+        if not hasattr(args_ns, k):
+            setattr(args_ns, k, v)
+
+    def _fix(s):
+        random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+        np.random.seed(s); cudnn.deterministic = True; cudnn.benchmark = False
+
+    device = torch.device(device_str)
+    rows = []
+    for dataset in datasets:
+        print(f'\n=== {dataset} ===')
+        _fix(seed)
+        args_ns.dataset = dataset
+        path = os.path.join(data_root, dataset, 'dataset.pkl')
+        with open(path, 'rb') as f:
+            data_raw = pickle.load(f)
+        args_ns.item_num = len(data_raw['smap'])
+        loader = Data_Test(data_raw['train'], data_raw['val'], data_raw['test'],
+                           args_ns).get_pytorch_dataloaders()
+
+        teacher_ckpt = f'{artifacts_root}/{dataset}/teacher/teacher.pt'
+        student_run = f'seed{seed}_beta{beta}_tau{tau}'
+        student_ckpt = f'{artifacts_root}/{dataset}/{student_run}/student_final.pt'
+        if not os.path.exists(teacher_ckpt) or not os.path.exists(student_ckpt):
+            print(f'  [skip] missing ckpt: teacher={os.path.exists(teacher_ckpt)}, '
+                  f'student={os.path.exists(student_ckpt)}')
+            continue
+
+        teacher = Att_Diffuse_model(create_model_diffu(args_ns), args_ns).to(device)
+        teacher.load_state_dict(torch.load(teacher_ckpt, map_location=device))
+        teacher.eval()
+        student = ConsistencyStudent(teacher, args_ns).to(device)
+        student.load_state_dict(torch.load(student_ckpt, map_location=device))
+        student.eval()
+
+        teacher_metrics = evaluate_teacher_full_nfe(teacher, loader, device)
+        student_metrics = evaluate_at_nfe(student, loader, num_steps=nfe_student,
+                                          device=device)
+
+        seq, target = next(iter(loader))
+        seq, target = seq.to(device), target.to(device)
+
+        def _t():
+            _, rep, *_ = teacher(seq, target, train_flag=False)
+            return teacher.diffu_rep_pre(rep)
+
+        def _s():
+            return student.predict_scores(seq, num_steps=nfe_student)
+
+        def _time(fn):
+            for _ in range(n_warmup): _ = fn()
+            if device.type == 'cuda': torch.cuda.synchronize()
+            t0 = time.time()
+            for _ in range(n_runs): _ = fn()
+            if device.type == 'cuda': torch.cuda.synchronize()
+            return (time.time() - t0) * 1000.0 / n_runs / seq.size(0)
+
+        t_lat = _time(_t)
+        s_lat = _time(_s)
+        speedup = t_lat / s_lat if s_lat > 0 else float('inf')
+
+        rows.append({
+            'dataset':       dataset,
+            'teacher_steps': diffusion_steps,
+            'teacher_ms':    t_lat,
+            'teacher_HR10':  teacher_metrics['HR@10'],
+            'student_steps': nfe_student,
+            'student_ms':    s_lat,
+            'student_HR10':  student_metrics['HR@10'],
+            'speedup':       speedup,
+        })
+        print(f'  Teacher (NFE={diffusion_steps}): {t_lat:.4f} ms/query  '
+              f'HR@10={teacher_metrics["HR@10"]:.4f}')
+        print(f'  RCCD    (NFE={nfe_student}): {s_lat:.4f} ms/query  '
+              f'HR@10={student_metrics["HR@10"]:.4f}')
+        print(f'  Speedup: {speedup:.2f}x')
+
+    print('\n' + '=' * 80)
+    print(f'LATENCY TABLE  (n_runs={n_runs}, batch_size={batch_size}, '
+          f'seed={seed}, NFE_student={nfe_student})')
+    print('=' * 80)
+    hdr = (f"{'Dataset':<14} {'Method':<14} {'Steps':<7} "
+           f"{'Latency (ms)':<14} {'Speedup vs DiffuRec':<22} {'HR@10':<8}")
+    print(hdr); print('-' * len(hdr))
+    for r in rows:
+        print(f"{r['dataset']:<14} {'DiffuRec':<14} {r['teacher_steps']:<7} "
+              f"{r['teacher_ms']:<14.4f} {'1.00x':<22} {r['teacher_HR10']:<8.4f}")
+        speed_str = f"{r['speedup']:.2f}x"
+        print(f"{'':<14} {'RCCD (ours)':<14} {r['student_steps']:<7} "
+              f"{r['student_ms']:<14.4f} {speed_str:<22} {r['student_HR10']:<8.4f}")
+        print('-' * len(hdr))
+    return rows
+
+
+# ===================================================================
+# Section 10: CLI
 # ===================================================================
 
 DRIVE_BASE = '/content/drive/MyDrive/diffurec-distillation-results/consistency-diffurec-after-sweep'
@@ -871,10 +1004,14 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--mode', required=True,
                    choices=['summary', 'plots', 'sweep', 'length_aware',
-                            'multi_seed_stats', 'latency', 'all'])
+                            'multi_seed_stats', 'latency', 'latency_from_ckpts',
+                            'all'])
     p.add_argument('--dataset', default=None)
+    p.add_argument('--datasets', nargs='+', default=None,
+                   help='For latency_from_ckpts: list of datasets to measure.')
     p.add_argument('--json_paths', nargs='+', default=None)
     p.add_argument('--artifacts_root', default=f'{DRIVE_BASE}/artifacts')
+    p.add_argument('--data_root', default='../datasets/data')
     p.add_argument('--metric', default='HR@10')
     p.add_argument('--nfe', default='1')
     p.add_argument('--nfe_grid', type=int, nargs='+', default=[1, 2, 4, 8])
@@ -882,6 +1019,14 @@ def main():
     p.add_argument('--tau_target', type=float, default=0.1)
     p.add_argument('--seed_filter', type=int, default=None)
     p.add_argument('--run_name', default=None)
+    # ----- for latency_from_ckpts -----
+    p.add_argument('--latency_seed', type=int, default=1907)
+    p.add_argument('--latency_n_runs', type=int, default=1000)
+    p.add_argument('--latency_n_warmup', type=int, default=100)
+    p.add_argument('--latency_batch_size', type=int, default=1)
+    p.add_argument('--latency_nfe_student', type=int, default=1)
+    p.add_argument('--diffusion_steps', type=int, default=32)
+    p.add_argument('--max_len', type=int, default=50)
     args = p.parse_args()
 
     def _need_jsons():
@@ -943,6 +1088,25 @@ def main():
         length_aware_compare(args.dataset, args.artifacts_root,
                              [baseline_rn, best_rn],
                              labels=['CD-only', 'RCCD'])
+
+    if args.mode == 'latency_from_ckpts':
+        datasets = args.datasets or ([args.dataset] if args.dataset else None)
+        if not datasets:
+            raise SystemExit('latency_from_ckpts needs --datasets a b c or --dataset a')
+        _measure_latency_from_checkpoints(
+            datasets=datasets,
+            artifacts_root=args.artifacts_root,
+            data_root=args.data_root,
+            seed=args.latency_seed,
+            beta=args.beta_target,
+            tau=args.tau_target,
+            n_runs=args.latency_n_runs,
+            n_warmup=args.latency_n_warmup,
+            nfe_student=args.latency_nfe_student,
+            diffusion_steps=args.diffusion_steps,
+            max_len=args.max_len,
+            batch_size=args.latency_batch_size,
+        )
 
 
 if __name__ == '__main__':

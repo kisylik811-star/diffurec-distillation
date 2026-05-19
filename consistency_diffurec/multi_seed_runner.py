@@ -59,6 +59,9 @@ def parse_args():
     p.add_argument('--data_root', default='../datasets/data')
     p.add_argument('--max_len', type=int, default=50)
     p.add_argument('--device', default='cuda')
+    p.add_argument('--only_latency', action='store_true',
+               help='Skip all training; load existing checkpoints + JSON, '
+                    'remeasure latency only, update JSON in place.')
     p.add_argument('--num_gpu', type=int, default=1)
     p.add_argument('--batch_size', type=int, default=512)
     p.add_argument('--hidden_size', type=int, default=128)
@@ -202,12 +205,83 @@ def measure_single_query_latency(model, loader, device, n_warmup=100, n_runs=100
     total_ms = (time.time() - t0) * 1000.0
     return total_ms / n_runs / seq.size(0)
 
+def _rerun_latency_only(args):
+    """Load existing JSON + checkpoints, remeasure latency, save back.
+
+    Re-uses: teacher.pt and seed{LATENCY_SEED}_beta{β}_tau{τ}/student_final.pt
+    """
+    device = torch.device(args.device)
+
+    # Load existing JSON
+    if not os.path.exists(args.out_json):
+        raise SystemExit(f'--only_latency requires existing JSON at {args.out_json}')
+    with open(args.out_json) as f:
+        results = json.load(f)
+    print(f'[only_latency] loaded existing results from {args.out_json}')
+
+    # Load data (need for latency batch sampling)
+    fix_seed(args.teacher_seed)
+    _, _, test_loader = load_data(args)
+
+    # Load teacher
+    teacher_ckpt = args.teacher_ckpt or args.save_teacher_ckpt
+    teacher = Att_Diffuse_model(create_model_diffu(args), args).to(device)
+    teacher.load_state_dict(torch.load(teacher_ckpt, map_location=device))
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+
+    # Load student (seed=1907 RCCD)
+    run_name = f'seed{LATENCY_SEED}_beta{args.contrast_weight}_tau{args.contrast_temperature}'
+    student_ckpt = f'{ARTIFACTS_ROOT}/{args.dataset}/{run_name}/student_final.pt'
+    if not os.path.exists(student_ckpt):
+        raise SystemExit(f'Missing student checkpoint: {student_ckpt}')
+    student = ConsistencyStudent(teacher, args, ema_decay=args.ema_decay).to(device)
+    student.load_state_dict(torch.load(student_ckpt, map_location=device))
+    student.eval()
+    print(f'[only_latency] loaded teacher + student (run={run_name})')
+
+    # Measure
+    print('\n[Latency] grid measurement')
+    sample_batch = next(iter(test_loader))
+    results['latency'] = measure_latency_grid(
+        teacher, student, sample_batch, device, args.nfe_grid,
+    )
+
+    print(f'[Latency] single-query (bs={args.latency_batch_size}, '
+          f'n_runs={args.latency_n_runs}, seed={LATENCY_SEED}, NFE=1)')
+    fix_seed(LATENCY_SEED)
+    bs1_loader = _build_latency_loader(args, target_batch_size=args.latency_batch_size)
+    t_lat = measure_single_query_latency(
+        teacher, bs1_loader, device,
+        n_runs=args.latency_n_runs, mode='teacher')
+    s_lat = measure_single_query_latency(
+        student, bs1_loader, device,
+        n_runs=args.latency_n_runs, mode='student', num_steps=1)
+    results['latency_single_query'] = {
+        'batch_size': args.latency_batch_size,
+        'n_runs':     args.latency_n_runs,
+        'seed':       LATENCY_SEED,
+        'teacher_ms':       t_lat,
+        'student_ms_nfe1':  s_lat,
+        'speedup':          t_lat / s_lat if s_lat > 0 else float('inf'),
+    }
+    print(f'  Teacher: {t_lat:.4f} ms, Student NFE=1: {s_lat:.4f} ms, '
+          f'speedup={results["latency_single_query"]["speedup"]:.2f}x')
+
+    # Save back
+    with open(args.out_json, 'w') as f:
+        json.dump(results, f, indent=2, default=float)
+    print(f'\n[Done] latency fields updated in {args.out_json}')
 
 def main():
     args = parse_args()
     args.save_teacher_ckpt = args.save_teacher_ckpt.format(dataset=args.dataset)
     if args.out_json is None:
         args.out_json = f'{RESULTS_ROOT}/multiseed_{args.dataset}.json'
+
+    if args.only_latency:
+        return _rerun_latency_only(args)
 
     Path(os.path.dirname(args.out_json) or '.').mkdir(parents=True, exist_ok=True)
     Path(os.path.dirname(args.save_teacher_ckpt) or '.').mkdir(parents=True, exist_ok=True)
