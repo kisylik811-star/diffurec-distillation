@@ -106,10 +106,17 @@ def parse_args():
     p.add_argument('--lrs', type=float, nargs='+',
                    default=[1e-4, 3e-4, 1e-3])
     p.add_argument('--two_stage', action='store_true', default=True,
-                   help='Two-stage grid: first (β, τ) at default lr, then lr at best (β, τ). '
-                        'Reduces full grid (β×τ×lr) to (β×τ + lr).')
+                   help='Two-stage grid: stage 1 = lr at default (β, τ), '
+                        'stage 2 = (β, τ) at best lr. Reduces full grid '
+                        '(β×τ×lr) to (lr + β×τ).')
+    p.add_argument('--default_beta', type=float, default=1.0,
+                   help='β used in stage-1 lr search (frozen). 1.0 = neutral '
+                        'balance between CD and InfoNCE.')
+    p.add_argument('--default_tau', type=float, default=0.1,
+                   help='τ used in stage-1 lr search (frozen). 0.1 = standard '
+                        'contrastive learning default (SimCLR, MoCo).')
     p.add_argument('--default_lr', type=float, default=3e-4,
-                   help='lr used in stage-1 of two_stage grid (frozen).')
+                   help='lr used as fallback if --two_stage is disabled.')
 
     p.add_argument('--out_json', default=None)
 
@@ -203,14 +210,17 @@ def main():
 
     # --- Build grid ---
     if args.two_stage:
-        # Stage 1: vary (β, τ) at fixed default_lr
-        configs_stage1 = [(b, t, args.default_lr) for b, t in product(args.betas, args.taus)]
+        # Stage 1: vary lr at fixed default (β, τ)
+        configs_stage1 = [(args.default_beta, args.default_tau, lr) for lr in args.lrs]
         configs = configs_stage1
     else:
         configs = list(product(args.betas, args.taus, args.lrs))
 
     print(f'\n[Stage 1] configs: {len(configs)}, '
           f'total runs: {len(configs) * len(args.selection_seeds)}')
+    if args.two_stage:
+        print(f'[Stage 1] varying lr ∈ {args.lrs} at β={args.default_beta}, '
+              f'τ={args.default_tau} (RCCD active, contrastive component enabled)')
 
     grid_results = {}  # key: (β, τ, lr) → {seed: val_hr10}
     t0 = time.time()
@@ -233,24 +243,31 @@ def main():
     print(f'\n[Stage 1 best] β={best_beta}, τ={best_tau}, lr={best_lr} '
           f'→ mean val HR@10 = {config_means[best_cfg]:.4f}')
 
-    # --- Stage 2: vary lr around best β, τ ---
+    # --- Stage 2: vary (β, τ) at best lr ---
     if args.two_stage:
-        remaining_lrs = [lr for lr in args.lrs if lr != best_lr]
-        if remaining_lrs:
-            print(f'\n[Stage 2] varying lr ∈ {remaining_lrs} at β={best_beta}, τ={best_tau}')
-            for lr in remaining_lrs:
+        bt_pairs = [(b, t) for b, t in product(args.betas, args.taus)
+                    if not (b == args.default_beta and t == args.default_tau)]
+        if bt_pairs:
+            print(f'\n[Stage 2] varying (β, τ) ∈ {len(bt_pairs)} combinations '
+                  f'at lr={best_lr}')
+            for ci, (beta, tau) in enumerate(bt_pairs):
                 seed_vals = {}
                 for seed in args.selection_seeds:
-                    print(f'\n  β={best_beta}, τ={best_tau}, lr={lr}, seed={seed}')
-                    v, _ = train_one_config(args, teacher, best_beta, best_tau, lr, seed, logger)
+                    print(f'\n  [{ci+1}/{len(bt_pairs)}] β={beta}, τ={tau}, '
+                          f'lr={best_lr}, seed={seed}  '
+                          f'elapsed={time.time()-t0:.0f}s')
+                    v, _ = train_one_config(args, teacher, beta, tau, best_lr,
+                                            seed, logger)
                     seed_vals[seed] = v
                     print(f'    val HR@10 = {v:.4f}')
-                grid_results[(best_beta, best_tau, lr)] = seed_vals
-                config_means[(best_beta, best_tau, lr)] = float(np.mean(list(seed_vals.values())))
-            # Recompute best across lrs (β, τ fixed)
-            best_lr = max([lr for lr in args.lrs],
-                          key=lambda lr: config_means.get((best_beta, best_tau, lr), -1))
-            best_cfg = (best_beta, best_tau, best_lr)
+                grid_results[(beta, tau, best_lr)] = seed_vals
+                config_means[(beta, tau, best_lr)] = float(
+                    np.mean(list(seed_vals.values())))
+            # Recompute best across (β, τ) at fixed best_lr
+            candidates = [cfg for cfg in config_means
+                          if cfg[2] == best_lr]
+            best_cfg = max(candidates, key=lambda c: config_means[c])
+            best_beta, best_tau, best_lr = best_cfg
 
     print(f'\n========== FINAL BEST CONFIG ==========')
     print(f'  β  = {best_cfg[0]}')
