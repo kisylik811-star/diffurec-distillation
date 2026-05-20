@@ -4,18 +4,19 @@ Hyperparameter selection for RCCD on Toys.
 Grid search over (β, τ, lr) with selection seeds disjoint from evaluation seeds.
 Best configuration chosen by mean val HR@10 (NFE=1) across selection seeds.
 
-Selection seeds:  {1994, 2024, 91}
+Selection seeds:  {2017, 2024, 1997}
 Evaluation seeds: {1907, 1977, 2015, 23, 88}  (used later in multi_seed_runner.py)
 
 Output:
-  - {DRIVE_BASE}/artifacts/hp_selection/{dataset}/sweep_results.json
+  - {DRIVE_BASE}/sweep_results_{dataset}.json
   - Per-config artifacts under {DRIVE_BASE}/artifacts/{dataset}/{run_name}/
+  - Per-config logs      under {DRIVE_BASE}/logs/{dataset}/hp_selection/{run_name}.csv
   - Final best config printed to stdout
 
 Usage (from consistency_diffurec/):
   python hp_selection.py \\
-      --dataset amazon_toys \\
-      --selection_seeds 1994 2024 91 \\
+      --dataset toys \\
+      --selection_seeds 2017 2024 1997 \\
       --betas 0.1 0.5 1.0 2.0 \\
       --taus 0.05 0.1 0.2 0.5 \\
       --lrs 1e-4 3e-4 1e-3
@@ -40,9 +41,11 @@ from trainer import model_train
 from consistency_diffurec import ConsistencyStudent
 from distill_trainer import distill_train, evaluate_at_nfe
 
-DRIVE_BASE = '/content/drive/MyDrive/diffurec-distillation-results/consistency-diffurec-after-sweep'
+DRIVE_BASE = '/content/drive/MyDrive/consistency_diffurec/hp_selection'
 ARTIFACTS_ROOT = f'{DRIVE_BASE}/artifacts'
 LOGS_ROOT = f'{DRIVE_BASE}/logs'
+# Учительские чекпоинты лежат отдельно — общие для всех экспериментов.
+TEACHERS_ROOT = '/content/drive/MyDrive/consistency_diffurec/teachers_ckpts'
 
 
 def parse_args():
@@ -84,9 +87,13 @@ def parse_args():
     # ----- Teacher -----
     p.add_argument('--teacher_epochs', type=int, default=200)
     p.add_argument('--teacher_seed', type=int, default=1907)
-    p.add_argument('--teacher_ckpt', default=None)
+    p.add_argument('--teacher_ckpt', default=None,
+                   help='Путь к предобученному учителю. По умолчанию: '
+                        f'{TEACHERS_ROOT}/teacher_{{dataset}}.pt')
     p.add_argument('--save_teacher_ckpt',
-                   default=f'{ARTIFACTS_ROOT}/{{dataset}}/teacher/teacher.pt')
+                   default=f'{TEACHERS_ROOT}/teacher_{{dataset}}.pt',
+                   help='Куда положить чекпоинт, если учитель будет обучаться '
+                        'с нуля. В норме не используется — чекпоинт обычно уже есть.')
 
     # ----- Distillation defaults -----
     p.add_argument('--distill_epochs', type=int, default=200)
@@ -98,7 +105,7 @@ def parse_args():
 
     # ----- Selection grid -----
     p.add_argument('--selection_seeds', type=int, nargs='+',
-                   default=[1994, 2024, 91])
+                   default=[2017, 2024, 1997])
     p.add_argument('--betas', type=float, nargs='+',
                    default=[0.1, 0.5, 1.0, 2.0])
     p.add_argument('--taus', type=float, nargs='+',
@@ -124,7 +131,7 @@ def parse_args():
     args.epochs = args.teacher_epochs
     args.save_teacher_ckpt = args.save_teacher_ckpt.format(dataset=args.dataset)
     if args.out_json is None:
-        args.out_json = f'{ARTIFACTS_ROOT}/hp_selection/{args.dataset}/sweep_results.json'
+        args.out_json = f'{DRIVE_BASE}/sweep_results_{args.dataset}.json'
     return args
 
 
@@ -179,7 +186,8 @@ def train_one_config(args, teacher, beta, tau, lr, seed, logger):
 def main():
     args = parse_args()
     Path(os.path.dirname(args.out_json) or '.').mkdir(parents=True, exist_ok=True)
-    Path(os.path.dirname(args.save_teacher_ckpt) or '.').mkdir(parents=True, exist_ok=True)
+    # NOTE: папку для save_teacher_ckpt создаём ТОЛЬКО если реально будем обучать
+    # учителя с нуля (см. ниже). В норме чекпоинт уже есть и эта ветка не нужна.
     device = torch.device(args.device)
     logger = _DummyLogger()
 
@@ -202,6 +210,9 @@ def main():
         teacher.load_state_dict(torch.load(teacher_ckpt, map_location=device))
     else:
         print(f'[Teacher] training from scratch (seed={args.teacher_seed})')
+        # Создаём папку под чекпоинт только перед самим обучением.
+        Path(os.path.dirname(args.save_teacher_ckpt) or '.').mkdir(
+            parents=True, exist_ok=True)
         teacher, _ = model_train(tra, val, tst, teacher, args, logger)
         torch.save(teacher.state_dict(), args.save_teacher_ckpt)
     teacher.eval()

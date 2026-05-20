@@ -23,7 +23,6 @@ import json
 import os
 import pickle
 import random
-import shutil
 import time
 from pathlib import Path
 
@@ -41,10 +40,12 @@ from distill_trainer import (
 )
 from evaluation import evaluate_teacher_truncated, measure_latency_grid
 
-DRIVE_BASE = '/content/drive/MyDrive/diffurec-distillation-results/consistency-diffurec-after-sweep'
+DRIVE_BASE = '/content/drive/MyDrive/consistency_diffurec/multi_seed_runs'
 ARTIFACTS_ROOT = f'{DRIVE_BASE}/artifacts'
 LOGS_ROOT = f'{DRIVE_BASE}/logs'
-RESULTS_ROOT = f'{DRIVE_BASE}/artifacts/results'
+RESULTS_ROOT = f'{DRIVE_BASE}/results'
+# Учительские чекпоинты лежат отдельно — общие для всех экспериментов.
+TEACHERS_ROOT = '/content/drive/MyDrive/consistency_diffurec/teachers_ckpts'
 
 # Seed for the single-shot latency measurement (deterministic init only;
 # latency itself is invariant to seed).
@@ -92,9 +93,13 @@ def parse_args():
 
     # ----- Teacher -----
     p.add_argument('--teacher_epochs', type=int, default=200)
-    p.add_argument('--teacher_ckpt', default=None)
+    p.add_argument('--teacher_ckpt', default=None,
+                   help='Путь к предобученному учителю. По умолчанию: '
+                        f'{TEACHERS_ROOT}/teacher_{{dataset}}.pt')
     p.add_argument('--save_teacher_ckpt',
-                   default=f'{ARTIFACTS_ROOT}/{{dataset}}/teacher/teacher.pt')
+                   default=f'{TEACHERS_ROOT}/teacher_{{dataset}}.pt',
+                   help='Куда сохранять учителя если придётся обучать с нуля. '
+                        'В норме не используется.')
 
     # ----- Distillation hyperparameters (selected on Toys via hp_selection.py) -----
     p.add_argument('--distill_lr', type=float, default=1e-3,
@@ -284,7 +289,7 @@ def main():
         return _rerun_latency_only(args)
 
     Path(os.path.dirname(args.out_json) or '.').mkdir(parents=True, exist_ok=True)
-    Path(os.path.dirname(args.save_teacher_ckpt) or '.').mkdir(parents=True, exist_ok=True)
+    # NOTE: папку для save_teacher_ckpt создаём только если реально обучаем учителя.
 
     device = torch.device(args.device)
     logger = _DummyLogger()
@@ -321,19 +326,11 @@ def main():
     else:
         print(f'[Teacher] training from scratch ({args.teacher_epochs} epochs, '
               f'seed={args.teacher_seed})')
+        # Создаём папку под чекпоинт только перед обучением.
+        Path(os.path.dirname(args.save_teacher_ckpt) or '.').mkdir(
+            parents=True, exist_ok=True)
         teacher, _ = model_train(tra_loader, val_loader, test_loader, teacher, args, logger)
         torch.save(teacher.state_dict(), args.save_teacher_ckpt)
-        # Also save a copy under artifacts/<dataset>/teacher/
-        teacher_dir = Path(ARTIFACTS_ROOT) / args.dataset / 'teacher'
-        teacher_dir.mkdir(parents=True, exist_ok=True)
-        copy_path = teacher_dir / 'teacher.pt'
-        if not copy_path.exists():
-            shutil.copy(args.save_teacher_ckpt, copy_path)
-        # Save teacher config
-        with open(teacher_dir / 'config.json', 'w') as f:
-            json.dump({k: v for k, v in vars(args).items()
-                       if isinstance(v, (int, float, str, bool, list, type(None)))},
-                      f, indent=2)
 
     teacher.eval()
     for p in teacher.parameters():

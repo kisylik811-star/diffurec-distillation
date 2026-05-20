@@ -21,6 +21,7 @@ import argparse
 import os
 import pickle
 import random
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -33,9 +34,11 @@ from trainer import model_train
 from consistency_diffurec import ConsistencyStudent
 from distill_trainer import distill_train, evaluate_at_nfe
 
-DRIVE_BASE = '/content/drive/MyDrive/diffurec-distillation-results/consistency-diffurec-after-sweep'
+DRIVE_BASE = '/content/drive/MyDrive/consistency_diffurec/sanity_check'
 ARTIFACTS_ROOT = f'{DRIVE_BASE}/artifacts'
 LOGS_ROOT = f'{DRIVE_BASE}/logs'
+# Учительские чекпоинты лежат отдельно — общие для всех экспериментов.
+TEACHERS_ROOT = '/content/drive/MyDrive/consistency_diffurec/teachers_ckpts'
 
 
 def parse_args():
@@ -77,9 +80,12 @@ def parse_args():
     # ----- Teacher -----
     p.add_argument('--teacher_epochs', type=int, default=200)
     p.add_argument('--teacher_seed', type=int, default=1907)
-    p.add_argument('--teacher_ckpt', default=None)
+    p.add_argument('--teacher_ckpt', default=None,
+                   help='Путь к предобученному учителю. По умолчанию: '
+                        f'{TEACHERS_ROOT}/teacher_{{dataset}}.pt')
     p.add_argument('--save_teacher_ckpt',
-                   default=f'{ARTIFACTS_ROOT}/{{dataset}}/teacher/teacher.pt')
+                   default=f'{TEACHERS_ROOT}/teacher_{{dataset}}.pt',
+                   help='Куда сохранять учителя если придётся обучать с нуля.')
 
     # ----- Distillation -----
     p.add_argument('--distill_epochs', type=int, default=200)
@@ -136,8 +142,8 @@ def load_data(args):
 
 def run_for_dataset(args, dataset, logger):
     args.dataset = dataset
-    args.save_teacher_ckpt = (f'{ARTIFACTS_ROOT}/{dataset}/teacher/teacher.pt')
-    Path(os.path.dirname(args.save_teacher_ckpt)).mkdir(parents=True, exist_ok=True)
+    args.save_teacher_ckpt = f'{TEACHERS_ROOT}/teacher_{dataset}.pt'
+    # NOTE: папку под чекпоинт учителя создаём только если будем его обучать.
     device = torch.device(args.device)
 
     # --- Teacher ---
@@ -152,6 +158,8 @@ def run_for_dataset(args, dataset, logger):
         teacher.load_state_dict(torch.load(teacher_ckpt, map_location=device))
     else:
         print(f'[{dataset}] [Teacher] training from scratch (seed={args.teacher_seed})')
+        Path(os.path.dirname(args.save_teacher_ckpt) or '.').mkdir(
+            parents=True, exist_ok=True)
         teacher, _ = model_train(tra, val, tst, teacher, args, logger)
         torch.save(teacher.state_dict(), args.save_teacher_ckpt)
     teacher.eval()
